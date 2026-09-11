@@ -221,6 +221,14 @@ const call = (agent, name, callId) => ({
     'escape: the escape parameters are the native ones',
     JSON.stringify(ctx.tools.get('native_edit', masked).parameters) === JSON.stringify(ctx.tools.get('edit', standingKey).parameters),
   )
+  // 逃生口**不进提示词**：描述只陈述事实（跑的是哪个原生工具、它的代价），不带任何"何时该用"的指令——
+  // 用不用由调用方在对话里点名，不该由提示词让模型自己去权衡。
+  const escapeDescription = ctx.tools.get('native_edit', masked).description
+  check(
+    'escape: the description states facts and gives no usage policy',
+    !/\bonly\b|\bshould\b|\bprefer\b|instead|unless|explicitly/i.test(escapeDescription),
+    escapeDescription,
+  )
   check('escape: an unmasked sibling keeps the plain native names', names(ctx, join('agent:escape-control')) === 'edit,edit_text,read,write,write_text')
 }
 
