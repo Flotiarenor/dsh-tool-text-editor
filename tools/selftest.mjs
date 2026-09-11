@@ -863,22 +863,16 @@ function maskSuite() {
   }
 
   {
-    // guard 模式：工具可见但调用被否决
+    // 守卫是"最迟防线"：它拦到的调用必须给出可操作的拒绝原因（点名本插件的两个工具）。
     const w = world()
-    applyMask(w.ctx, { mode: 'guard' })
+    applyMask(w.ctx, {})
     const watched = fakeAgent(['read', 'write', 'edit'])
     admit(w, watched)
-    check('mask: guard mode registers no restriction', watched.calls.restrict.length === 0, JSON.stringify(watched.calls.restrict))
     const reason = w.rowGuards[0]({ name: 'edit', agent: watched.agent })
     check(
-      'mask: guard mode still denies, with the same actionable reason',
+      'mask: the guard refuses with a reason naming our tools',
       typeof reason === 'string' && /edit_text/.test(reason) && /write_text/.test(reason),
       String(reason),
-    )
-    check(
-      'mask: guard mode keeps the tools visible, so the sweep must not restrict them',
-      watched.calls.register.length === 0 && watched.calls.sections.length === 2,
-      JSON.stringify(watched.calls),
     )
   }
 

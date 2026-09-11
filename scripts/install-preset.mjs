@@ -119,8 +119,7 @@ function pluginBlock(sourcePath, maskNative) {
       '# 收窄用 `agent.ctx.tools.restrict({ deny })`：注册表只有一套可见性解析器，被拒的名字既不在工具表里也调不动',
       '# （直呼得到 UNKNOWN_TOOL）；另注册同名空段遮蔽 tool:write / tool:edit 引导。只影响选了本 preset 的会话，',
       '# 其它 preset 照旧可用（天然对照组）；只点名本 agent 真的看得见的工具，归属判据靠探测对象的身份。',
-      '# `mode: guard` 改为"可见但拒绝"，`sections: []` 保留那两段引导；回退：删掉本行或给编辑行加',
-      '# `guidance: full`。',
+      '# 回退：删掉本行，或给编辑行加 `guidance: full`。',
       '- id: tool-native-edit-mask',
       `  name: '${MASK}'`,
     )

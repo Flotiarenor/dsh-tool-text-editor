@@ -10,8 +10,7 @@
  *
  * 断言：本组合的 agent 没有 write / edit、直呼其名得到 `UNKNOWN_TOOL`、原生引导消失，别的组合照旧看得见
  * 也调得动；常驻作用域仍注册着它们（可见性组合，非权限边界）；没有建档事件的 agent 第一次调用被守卫否决
- * 并就地收窄；`guard` 档可见但调不动且点名 `edit_text` / `write_text`；宿主平面（没有作用域）的门禁行只否决
- * 不收窄，并留下一条 warn。
+ * 并就地收窄；宿主平面（没有作用域）的门禁行只否决不收窄，并留下一条 warn。
  *
  * 组合时序（建档前挂载 / 换 preset）由 `tools/repro-mask.mjs` 用真实 `dsh-agent-presets` 验证。
  * 需要装有 `@deepseek-ai/cordis` / `dsh-tools` / `dsh-scope` / `dsh-system-prompt` / `dsh-agent` 的 dsh：
@@ -121,9 +120,9 @@ function captureWarnings(ctx, sink) {
 
 /**
  * 搭一套与 dsh 挂载形状一致的环境：`masked` 组合 = 原生行 + 门禁行，`other` 组合 = 只有原生行（对照）。
- * `settings` 是 `mode` 之外的行配置；返回上下文、常驻作用域键、三个建 agent 的入口与警告收集。
+ * `settings` 是行配置；返回上下文、常驻作用域键、三个建 agent 的入口与警告收集。
  */
-async function harness(mode, settings = {}) {
+async function harness(settings = {}) {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
   await ctx.plugin(ToolRuntime)
@@ -146,7 +145,7 @@ async function harness(mode, settings = {}) {
     inject: ['tools', 'systemPrompt'],
     apply(c) {
       captureWarnings(c, warnings)
-      applyMask(c, { mode, ...settings })
+      applyMask(c, settings)
     },
   })
 
@@ -182,7 +181,7 @@ const call = (agent, name, callId) => ({
 // ── deny 模式 ──
 
 {
-  const { ctx, standingKey, masked, control, silent: silentAgent, warnings } = await harness('deny')
+  const { ctx, standingKey, masked, control, silent: silentAgent, warnings } = await harness()
   const target = masked('agent:masked')
   const sibling = control('agent:control')
 
@@ -235,25 +234,6 @@ const call = (agent, name, callId) => ({
   check('deny: the mask row logged no failure', warnings.length === 0, JSON.stringify(warnings).slice(0, 200))
 }
 
-// ── guard 模式 ──
-
-{
-  const { ctx, masked } = await harness('guard')
-  const watched = masked('agent:watched')
-
-  const watchedNames = names(ctx, watched)
-  check('guard: the tools stay visible', watchedNames === 'edit,edit_text,read,write,write_text', watchedNames)
-  const refused = await ctx.tools.execute(call(watched, 'edit', 'guard-edit'))
-  const body = JSON.stringify(refused)
-  check(
-    'guard: the call is refused with a reason that points at our tools',
-    refused.isError === true && /edit_text/.test(body) && /write_text/.test(body),
-    body.slice(0, 200),
-  )
-  const ok = await ctx.tools.execute(call(watched, 'read', 'guard-read'))
-  check('guard: other tools are unaffected', ok.isError !== true, JSON.stringify(ok).slice(0, 120))
-}
-
 // ── 宿主平面：没有作用域的门禁行只做否决，绝不收窄 ──
 
 {
@@ -276,7 +256,7 @@ const call = (agent, name, callId) => ({
     inject: ['tools', 'systemPrompt'],
     apply(c) {
       captureWarnings(c, warnings)
-      applyMask(c, { mode: 'guard' })
+      applyMask(c, {})
     },
   })
   const plain = { id: 'agent:plain', session: { id: 'agent:plain' }, ctx }

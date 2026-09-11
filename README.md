@@ -29,9 +29,9 @@ package.
 
 The package installs nothing. Its one `peerDependencies` entry, `@deepseek-ai/dsh-tools`, is the host
 contract ("needs this dsh, and not a later major line") and resolves from the dsh installation, not beside
-the plugin. Range `>=0.1.0-rc.6 || >=0.1.5-rc.2`, verified against `0.1.0-rc.6` and `0.1.5-rc.2`: npm
-admits a prerelease only when its `major.minor.patch` tuple carries a prerelease comparator of its own, so
-one clause per verified line keeps a prerelease install from reading as an unmet peer.
+the plugin. The range carries two clauses, `>=0.1.0-rc.6 || >=0.1.5-rc.2`, because npm admits a prerelease
+only when the range has a comparator sharing its `major.minor.patch` tuple; each verified dsh line therefore
+needs its own clause, or a prerelease install reads as an unmet peer.
 
 ## Install
 
@@ -70,54 +70,45 @@ The tool names do not collide with the built-ins, so a host-plane insert is safe
 their guidance section in **every** session. Uninstall with `dsh plugin --profile web remove @flotiarenor/dsh-tool-text-editor`.
 Both installs may coexist, the preset layer shadowing the host layer with an identical definition.
 
-## Masking the built-in `write` / `edit` (optional)
+## Masking the built-in `write` / `edit`
 
-`lib/mask.mjs` is a separate plugin row: installed into a preset, that preset's sessions have no built-in
-`write` / `edit` at all. The installer takes a flag:
+The editor row **adds** `edit_text` / `write_text` and leaves the built-ins alone. Removing them is a second,
+separate row — `lib/mask.mjs` — that the installer only injects on request:
 
 ```powershell
-node scripts/install-preset.mjs --mask-native   # adds the tool-native-edit-mask row and writes guidance: short
+node scripts/install-preset.mjs --mask-native   # also injects the tool-native-edit-mask row (and guidance: short)
 ```
 
-It removes **2362 B per request** (`node tools/measure-context.mjs --vs-native`): two schemas (1754 B:
-`write` 728 + `edit` 1026, sandbox escalation fields included) plus two guidance sections (608 B: 220 +
-388); `guidance: short` on the editor row removes another 81 B (241 -> 160), for **2443 B per request**
-(~600 tokens).
+Two rows are forced, not a matter of taste: `tools.restrict()` is callable only from a **scoped context**
+(`agent.ctx`), and a preset row's own context *is* the standing scope where the natives are registered, so a row
+cannot hide tools from itself. Masking is therefore a fact about the composition, and only a second row can state
+it.
 
-| Channel | Call | Effect |
-| --- | --- | --- |
-| Guard, registered in `apply()` on the row's own scope layer | `ctx.tools.guard(...)` | **Order-independent**: the first native call of an agent that joined the preset at any time is refused with a reason naming `edit_text` / `write_text`, and that call narrows the agent, so the next request's table is already clean |
-| Tool catalog and execution | `agent.ctx.tools.restrict({ deny: ['write','edit'] })` | The named tools are **gone from the catalog and uncallable**: naming one yields `UNKNOWN_TOOL`; in `deny` mode the guard narrows that agent on the spot |
-| Prompt | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` | An empty same-named section in a nearer layer shadows the two sections `dsh-tool-fs` registers; now a redundant safety net, see the configuration table |
-| `agent/created` | listener for an agent created after the mount | That agent is narrowed immediately |
-| `tools/change` | emitted by `recompose()` after re-linking an agent's scope (the GUI "switch preset" path) | The row walks `ctx.agents.list()` and narrows every agent of its own composition |
-| Leaving the composition | per-agent registrations, each kept as a disposer | `restrict` and the empty shadowing sections sit on the **agent's own layer**, so they survive the preset; each disposer lifts them on re-link to a different preset, without which that agent would have neither the native names nor this plugin's tools (no write tool at all) |
+It removes **2362 B per request** (`node tools/measure-context.mjs --vs-native`): two schemas (1754 B: `write`
+728 + `edit` 1026, sandbox escalation fields included) plus two guidance sections (608 B: 220 + 388);
+`guidance: short` on the editor row removes another 81 B (241 -> 160), for **2443 B per request** (~600 tokens).
 
-| Mechanism | Detail |
+| Mechanism | How it works |
 | --- | --- |
-| `restrict()` scope | Callable only from a **scoped context** (`agent.ctx`); from the preset's standing scope it is refused, since names registered in that same layer are not restrictable globals |
-| Why the guard decides the timing | `AgentPresets.recompose()` re-links a scope parent instead of rebuilding the agent, so an agent the GUI created on the default preset and re-linked to the user's preset afterwards already fired `agent/created` under the old composition, and its listener never sees it. Measured on real session logs: of the `request/header` events of sessions running this preset, 25 still listed the native `write` / `edit` while only 3 were narrowed |
-| Membership probe | No import of `@deepseek-ai/dsh-scope` (zero dependencies and `node:`-only builtins are a hard gate, asserted by `tools/check-license.mjs`): the row probes `ctx.tools.guardReason(<a probe exec it minted itself>)`, which walks `exec.agent`'s scope-layer chain and reaches the row's guard only for agents carrying the row's layer, depending on `dsh-tools` alone |
-| Verdict | The probe's **object identity**, not its name: `guardReason()` runs before the registry decides whether the tool exists, so invisible names still reach guards ("pick an unused name" would not do), while a real dispatch mints a fresh execution object that never equals the probe or sees the sentinel. That sentinel also rejects a foreign guard refusing every call (the in-process subagent driver carries one; `guardReason` consults the global layer first) |
-| Lift rule | The three-state verdict (`member` / `outsider` / `unknown`) lifts a mask only on a definite `outsider`: an unanswerable probe (guard not armed, no `guardReason` in this dsh, a throwing query) or a foreign answer leaves that agent alone, since reading `unknown` as `outsider` would silently undo a working restriction. The price is symmetric and stated: the "switch preset away and get the natives back" half degrades too, so the row logs one warning instead of quietly doing half its job |
-| Lifecycle | The per-agent registrations live on the **agent's** fiber, so unloading the row (an HMR reload, `disabled: true` on the preset line) would strand them with nothing to lift them; an unload hook releases every agent the row masked |
-| Host-plane install | A row mounted on the host plane (profile layer) has no scope, so its guard lands in the global layer, where narrowing would hit agents of presets that never mounted this plugin. The same probe detects it (a probe carrying no agent is answered only from the global layer) and the row degrades to **guard-only**, with one warning. No config key expresses this: the mount shape decides |
+| Guard, armed in `apply()` on the row's own scope layer | Refuses the first native call of any agent, naming `edit_text` / `write_text`, and narrows that agent in the same call, so the next request's table is already clean. Being on the layer rather than on an event, its coverage does not depend on when the agent was created |
+| Tool catalog and execution | `agent.ctx.tools.restrict({ deny: ['write','edit'] })` — the named tools leave the catalog **and** become uncallable (naming one yields `UNKNOWN_TOOL`) |
+| Prompt | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` shadows the two guidance sections `dsh-tool-fs` registers. A redundant safety net: since 0.1.5-rc.2 those sections are visibility-gated and disappear on their own |
+| Membership | The guard is asked who it belongs to, because a preset can be swapped under a live agent. The row calls `ctx.tools.guardReason()` with an execution object **it minted itself**, so the answer is object identity, not a name: a real dispatch always mints a fresh object and can never be mistaken for the probe, and a foreign guard that refuses everything cannot answer for this row |
+| Leaving, and unloading | `restrict` and the shadowing sections sit on the **agent's own layer**, so they outlive the preset; each is kept as a disposer and lifted when the agent re-links elsewhere — otherwise that agent is left with neither the native names nor this plugin's tools, i.e. no way to write at all. Unloading the row does the same for every agent it masked |
+| Host-plane install | A row mounted on the host plane (profile layer) has no scope, so its guard lands in the global layer, where narrowing would hit presets that never mounted this plugin. The same probe detects exactly that and the row degrades to guard-only, with one warning. No config key expresses this — the mount shape decides |
 
-### Can the built-ins still be tested once masked? Yes - four ways
+Membership is deliberately three-state (`member` / `outsider` / `unknown`) and a mask is lifted only on a
+definite `outsider`: an unanswerable probe means "leave that agent alone", because reading it as `outsider` would
+silently undo a working restriction. A probe that cannot answer at all is reported once, loudly.
+
+### Observing the built-ins once masked: four ways
 
 | Way | How |
 | --- | --- |
-| **Another composition (another preset)** | The mask is a composition fact, not a global switch: an agent of another composition keeps both tools visible and callable, the control group `tools/probe-mask.mjs` and `tools/repro-mask.mjs` assert; a **sibling agent of the same preset** is masked too, deliberately |
-| **The probe** | `node tools/probe-mask.mjs` mounts the mask on the real dsh packages and registry (see "Self-test and gates"); 18 checks, exit code 2 without an installed dsh |
+| **Another composition (another preset)** | Masking is a composition fact, not a global switch: an agent of another composition keeps both tools visible and callable, the control group `tools/probe-mask.mjs` and `tools/repro-mask.mjs` assert; a **sibling agent of the same preset** is masked too, deliberately |
+| **The probe** | `node tools/probe-mask.mjs` mounts the mask on the real dsh packages and registry (see "Self-test and gates"); 15 checks, exit code 2 without an installed dsh |
 | **The built-ins driven directly** | `tools/measure-context.mjs --vs-native` calls `apply()` on the real `dsh-tool-fs` in-process and measures its schemas and sections; no agent is involved, so no mask can reach it |
-| **A temporary lift** | Give the `tool-native-edit-mask` row `disabled: true`, or switch it to `mode: 'guard'` |
-
-### `mode: 'guard'`: keep a window open
-
-`mode: 'guard'` keeps the apply-time guard and skips `restrict`, leaving the tools **visible** while
-refusing every call with a reason naming `edit_text` / `write_text`. The **schemas are still paid for**
-(both tables keep shipping, 1754 B) and the two guidance sections stay shadowed, since guidance left in for
-refused calls only invites the model to try; in exchange the built-ins stay callable and observable.
+| **A temporary lift** | Give the `tool-native-edit-mask` row `disabled: true` |
 
 ### Mask row configuration
 
@@ -125,18 +116,17 @@ The row has no Config schema either: `config:` is passed through as-is.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `'deny'` | `deny`: the names are gone from the catalog (via `restrict`) and the guard refuses whatever it can still see. `guard`: the tools stay visible and every call is refused |
 | `deny` | `['write','edit']` | the names to narrow; only names that agent actually sees are named |
-| `sections` | `['tool:write','tool:edit']` | the guidance sections to shadow with an empty section; `[]` turns the shadowing off. Now a **redundant safety net**: since dsh 0.1.5-rc.2 `dsh-tool-fs` evaluates its guidance sections per scope (`({ scope }) => ctx.tools.get('write', scope) === undefined ? '' : '...'`), so they disappear on their own once the tool is narrowed |
+| `sections` | `['tool:write','tool:edit']` | the guidance sections to shadow with an empty section; `[]` turns the shadowing off |
 
 ### Boundaries
 
 | Boundary | Meaning |
 | --- | --- |
-| **Not an authority boundary** | This is the live visibility composition DSH documents: the built-ins **stay registered** (a plugin/tool inventory may still list them) and a shell command can still write files; `tools/probe-mask.mjs` asserts exactly that |
+| **Not an authority boundary** | Visibility composition as DSH defines it: the built-ins **stay registered** and a shell command can still write files |
 | **A composition fact, not a global switch** | The row touches only the agents that joined its composition: the sibling agent of the same preset included, an agent of another preset not at all. A host-plane install is the one exception, and it never narrows |
 | **Names are configuration** | `deny` / `sections` are config, so a rename or split of `tool-fs` is a config edit |
-| **Only visible names are named** | A preset without `tool-fs` gets no restriction at all (never an unknown-name error) while the section shadowing still applies, and the guard re-asks visibility per call (`tools.get(name, exec.agent)`), leaving a name that exists elsewhere but not for the caller alone |
+| **Only visible names are named** | A preset without `tool-fs` gets no restriction at all (never an unknown-name error), and the guard asks visibility per call, leaving a name that exists elsewhere but not for the caller alone |
 
 ## Tools
 
@@ -150,7 +140,7 @@ The row has no Config schema either: `config:` is passed through as-is.
 | `count` | The expected number of hits: occurrences of the literal for `old_text` (all of them replaced), regex hits for `grep`, covered lines for `lines`. Any mismatch refuses to write |
 | Trailing newline | Both anchor kinds span the line block **with** its trailing newline, so end `new_text` with a newline too; otherwise the replacement joins the following line and the file loses a line (the `+1/-2` stat reports it) |
 | Matching | Exact → relaxed (trailing whitespace, line-block similarity) → nearest candidates on a miss; a match hitting several places without `count` refuses to write, and a relaxed hit adds one `[warn]` line to the result |
-| No k-th hit | `count` is the single disambiguation knob: *confirmation* (declare the expected hits; a mismatch refuses), not *selection* (take one, leave the rest). To change one occurrence among several, make the anchor unique by quoting a longer `old_text` or naming the place with `lines` / `grep`; a wrong anchor then fails loudly instead of editing the wrong line silently |
+| No k-th hit | `count` is the only disambiguation knob, and it means *confirmation*, not *selection*. To change one occurrence among several, make the anchor unique — a longer `old_text`, or `lines` / `grep` |
 
 ### `write_text` — create or fully replace a file
 
@@ -182,35 +172,31 @@ FAIL                    # failure: the complete reason (it decides the next call
 <reason>
 ```
 
-**A successful call echoes neither the change nor the path.** Results are appended to the session history,
-so an echo accumulates per call while the caller has just sent `new_text`; `replace@17 +1/-1` already
-reports which lines changed and by how much, and `read` is one call away. Model-visible bytes are
-independent of input size (a 400 KB single-line write still returns two lines / 17 B). The path is bound to
-its call (`tool/result` carries `source.callId`) and the caller's `file_path` argument is in the same turn's
-history, so echoing it adds zero information — and it costs: across 86 results in 79 real session logs a
-success averaged 116 B, of which the `WROTE <path>` line was 55.6 B (48%), against 66 B path-free (−43%).
-The path survives where it carries meaning: in a failure **reason** that has to name the file, and in the
-GUI's own rendering of the call arguments.
+**A successful call echoes neither the change nor the path.** Results are appended to the session history, so an
+echo accumulates per call while the caller has just sent `new_text`; `replace@17 +1/-1` already reports which
+lines changed and by how much, and `read` is one call away. The path is bound to its call (`tool/result` carries
+`source.callId`) and the caller's `file_path` is in the same turn's history, so echoing it adds nothing — and it
+costs: across 86 results in 79 real session logs, one success averaged 116 B of which the `WROTE <path>` line was
+55.6 B (48%), against 66 B path-free (−43%). It survives where it carries meaning: in a failure reason that has
+to name the file, and in the GUI's own rendering of the call arguments.
 
-Nothing else is written: no backup, no ledger, no diff projection. What the change was is visible in the
-GUI from the call's own arguments (`old_text` / `grep` / `lines` plus `new_text`), which the host already
-renders, and the previous content is one `read` away. A failing system call is reported as errno plus one
-reason (`ENOENT`, `ENOTDIR`, `EISDIR`, `EACCES`, …); the absolute paths and internal temp filename
-(`.<name>.<pid><ts>.tmp`) of the raw Node message stay out of the model context.
+Failures are reported as an errno plus one reason (`ENOENT`, `ENOTDIR`, `EISDIR`, `EACCES`, …); the absolute
+paths and the internal temp filename (`.<name>.<pid><ts>.tmp`) of the raw Node message stay out of the model
+context.
 
-The one shape the built-ins offer and this plugin does not is a diff body in the result: the built-in `write`
-returns `before` / `after` so the host can draw a card, which costs 128 B per call. Here the host draws from
-the call arguments instead, which it already has.
+The one thing the built-ins offer and this plugin does not is a diff body in the result — the built-in `write`
+returns `before` / `after` so the host can draw a card, at 128 B per call. Here the host draws from the call
+arguments it already has.
 
 ## Deliberate limitations
 
 | Limitation | Detail |
 | --- | --- |
-| **Writes bypass `ctx.fs`** | The plugin writes the file itself: the fs-observation policy (read-before-write, version freshness), the sandbox, `sandbox_permissions` escalation and Windows DACL preservation are all skipped, and the atomic write is its own (same-directory temp file + fsync + rename). Nothing else enforces anything on this path, so the session file policy is mirrored for the one mode that forbids writing: `read-only` refuses both tools before any I/O, naming the session policy rather than the path. `sandboxPolicy` is consumed opportunistically (`ctx.get`); absent, or answered by a throwing resolver, the previous behaviour stands instead of writes bricking |
-| **Only `read-only` is mirrored, and no path is restricted** | Under `workspace-write` and `danger-full-access` both tools write **any** path: outside the workspace, inside `.dsh/` or `.git/`, and through a junction / symlink pointing out of the workspace. The path guard this package used to carry decided by **string prefix**, so a symlink walked around it (a guard in appearance only) while it blocked positions the model may write in a full-access session. The plugin is therefore **not** a security boundary and does not replace host policy, sandbox or approvals: to restrict where writes land, use the session file policy, the sandbox and `sandbox_permissions` (or a shell-side guard); this package takes no part in that judgement |
+| **Writes bypass `ctx.fs`** | The plugin writes the file itself, so the fs-observation policy (read-before-write, version freshness), the sandbox, `sandbox_permissions` escalation and Windows DACL preservation are all skipped; the atomic write is its own (same-directory temp file + fsync + rename). Nothing else enforces anything on this path, so the session file policy is mirrored for the one mode that forbids writing: `read-only` refuses both tools before any I/O, naming the session policy rather than the path. `sandboxPolicy` is consumed opportunistically (`ctx.get`), so a deployment without it, or a resolver that throws, keeps writing instead of bricking |
+| **Only `read-only` is mirrored, and no path is restricted** | Under `workspace-write` and `danger-full-access` both tools write **any** path: outside the workspace, inside `.dsh/` or `.git/`, and through a junction / symlink pointing out of it. The plugin is **not** a security boundary: to restrict where writes land, use the session file policy, the sandbox and `sandbox_permissions` |
 | **Line anchors are not content-verified** | `lines` and `before` / `after <line>` locate text by line number alone: a wrong number does not fail, it edits somewhere else. Where the anchor must be verifiable, use `old_text` or `grep` |
 | **Per-target serialization is per process** | An in-process queue per target plus an atomic write keeps parallel tool calls from overwriting each other, but another dsh instance, an editor or any other process writing the same file still can, and external changes are not detected |
-| **UTF-8 text only** | Files containing NUL bytes (binary) or invalid UTF-8 are refused; a file marked read-only by the OS is refused too (the atomic rename fails with `EPERM`) and the attribute is never silently cleared |
+| **UTF-8 text only** | Files containing NUL bytes (binary) or invalid UTF-8 are refused; a file marked read-only by the OS is refused too (the atomic rename fails with `EPERM`) |
 | **Creating a file fills in missing parent directories** | A missing `write_text` target gets its parents created (`mkdir -p`, as the built-in `write` does), with no extra output |
 
 ## Configuration
@@ -239,22 +225,22 @@ writing the same fixture twice:
 | Literal appearing twice | refused (`FS_AMBIGUOUS_EDIT`) unless `replace_all: true` | refused unless `count` declares it |
 | Success result text | 128 B, echoing `before` / `after` for the GUI | 17–21 B, echoing nothing |
 
-So the honest accounting is: **one correctness fix (the BOM) and one behaviour fix (line-ending style),
-plus cheaper results.** The rest of the gap is convenience — anchors that name a position, and a fallback
-for near-miss anchors. If you never touch BOM files, the only thing you gain is tokens (roughly 3–45 % per
-call depending on the scenario), and you pay for it with two competing write tools in the model's catalog.
+So the honest accounting is: **one correctness fix (the BOM) and one behaviour fix (line-ending style), plus
+cheaper results.** The rest is convenience — anchors that name a position, and a fallback for near-miss anchors.
+If you never touch BOM files, the only thing you gain is tokens, and you pay for it with two competing write
+tools in the model's catalog.
 
 ## Self-test and gates
 
 ```powershell
 # run from the root of a clone of this repository
-node tools/selftest.mjs                 # 150/150 on Windows + Node 24
+node tools/selftest.mjs                 # 148/148 on Windows + Node 24
 node tools/check-license.mjs            # 30/30 license / dependency / Node-only gate
 node tools/gen-schema.mjs               # embedded schemas still match the DSL
 node tools/measure-context.mjs          # per-scenario model-visible bytes
 node tools/audit-session.mjs            # reconcile against real session logs (text-shape check)
 node tools/audit-session.mjs --tools    # the real tool table of every request/header (mask acceptance)
-node tools/probe-mask.mjs               # the mask on real dsh packages: registry semantics (18 checks, exit 2 without them)
+node tools/probe-mask.mjs               # the mask on real dsh packages: registry semantics (15 checks, exit 2 without them)
 node tools/repro-mask.mjs               # the mask on real presets + agents: composition timing (23 checks, exit 2 without them)
 ```
 
@@ -263,24 +249,22 @@ more than 2 KB of model-visible text into the context. The current worst scenari
 hint; a successful call is always two lines, 17–21 B.
 
 These live in the repository only: `tools/` is deliberately outside the `files` whitelist, so the published
-package is just the plugin, its preset installer, the docs and the license. `HANDOVER.md` is the internal dev
-handover (state, evidence, open work, operational steps), unpublished as well; `tools/check-license.mjs`
-keeps it under the same line-ending and CJK-spacing rules as the two READMEs.
+package is just the plugin, its preset installer, the docs and the license. Each script's own header documents
+what it asserts and why; what follows is the shape of each.
 
 | Tool | Behaviour |
 | --- | --- |
-| `tools/selftest.mjs` | Covers BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, relaxed matching reports (including the similarity threshold pinned on both sides), usage errors, binary/invalid-UTF-8 refusal, editable `.dsh/` and outside-workspace paths (no path guard), majority EOL inference, multi-hunk diffs, end-of-file newline changes, concurrent writes, parent-directory creation and errno-only failure text. Five suites: **plugin-layer** (`apply()` on a fake context: tool registration, the guidance section, every returned value satisfying `OUTPUT_SCHEMA` with exactly four fields, the literal `render()` text, the `root` / `newFileBom` plumbing, and that a write leaves no `.dsh/` behind); **return-value** (two lines at any input size, no change content, no repeated path); **policy** (`read-only` refuses both tools before any I/O while `workspace-write` / `danger-full-access` keep writing and a missing or throwing policy service does not brick writes); **mask** (a fake world for guard registration in `apply()`, the membership probe, `guardReason()` reaching the row's guard only for members of the composition, the `tools/change` sweep, leave-path disposal and rejoin, the host-plane degradation, only visible names named, what each mode calls, the empty sections and their orders, no double registration, an unusable probe never lifting a mask, a failed guard registration logged, a throwing registry or prompt service never escaping the listener); **guidance** (`full` / `short` / `false` plus a loud failure on an unknown value) |
-| `tools/probe-mask.mjs` | Rebuilds the preset mount shape with the real dsh packages (`dsh-tools` + `dsh-scope` + `dsh-system-prompt` + `cordis`) and the real `dsh-agent` registry: the mask row is mounted with a real scoped context (the guard has to land on that layer in `apply()`), and `agent/created` is dispatched by the registry instead of being handed to the listener by hand. It asserts the mask's registry semantics: a masked agent loses `write` / `edit` from its catalog, naming one yields `UNKNOWN_TOOL`, an agent of another composition keeps both, the native guidance disappears from the masked prompt only, the standing scope still has them registered (visibility composition, not authority), an agent that never got a creation event is still blocked by the apply-time guard and narrowed right away, `mode: 'guard'` keeps them visible while refusing the call, and a row mounted on the host plane degrades to guard-only and says so. 18 checks; exit code 2 without a dsh installation |
-| `tools/repro-mask.mjs` | (npm script `npm run repro:mask`) Drives the **real** `@deepseek-ai/dsh-agent-presets` service and **real** `@deepseek-ai/dsh-agent` registry inside a temp directory with real `agent.cordis.yml` compositions (this repo's `lib/mask.mjs` listed by absolute path), asserting the resulting tool table on every composition path: created after the mount, re-linked after creation (`recompose()`), first-time bind, switching away, and a child agent that joined its parent's composition, plus a host whose own guard refuses every call (the membership probe must not be fooled by it) and an agent of another composition as the control. 23 checks; the regression test for the composition-timing bug (4/7 before the fix), needing the same dsh packages (exit 2 without them) |
+| `tools/selftest.mjs` | The end-to-end suite, needing no dsh: BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, relaxed matching (the similarity threshold pinned on both sides), usage errors, binary/invalid-UTF-8 refusal, majority EOL inference, concurrent writes, parent-directory creation, errno-only failure text — plus a plugin layer (`apply()` on a fake context: registration, the guidance section, every value satisfying `OUTPUT_SCHEMA`, the literal `render()` text, config plumbing, no `.dsh/` left behind), a return-value layer, a policy layer (`read-only` refusals), a mask layer (a fake world for the guard, the membership probe, the sweep, disposal and the unload hook) and a guidance layer. 148 checks |
+| `tools/probe-mask.mjs` | Mask registry semantics on the real packages and the real `dsh-agent` registry, mounted on a real scoped context: a masked agent loses `write` / `edit` and naming one yields `UNKNOWN_TOOL`, another composition keeps both, the standing scope still has them registered, an agent with no creation event is still blocked by the apply-time guard, and a host-plane row degrades to guard-only. 15 checks; exit 2 without a dsh installation |
+| `tools/repro-mask.mjs` | Mask composition timing on the real `dsh-agent-presets` service: created after the mount, re-linked after creation, first bind, switched away, and a child agent via `composeFrom`, with a foreign-guard host and another composition as controls. 23 checks; the regression test for a timing bug that shipped once (4/7 before the fix), exit 2 without the packages |
 
 ### Measuring context cost
 
 | Tool | Behaviour |
 | --- | --- |
-| `tools/measure-context.mjs` | Drives `apply()` on a simulated context through the real `execute()` → `output.render()` path, printing input bytes, model-visible bytes, ratio and line count per scenario. `--cap N` exits 1 when a scenario exceeds N bytes; `--static` prints the per-request overhead; `--vs-native` adds the same figures for the host's `write` / `edit` (SKIP without a dsh installation). `--static --vs-native` is the source of the masking table above |
-| `tools/audit-session.mjs` | Reconciles real session logs (`<DSH_HOME>/sessions/`, multi-frame zstd, per call) and checks three things: whether each result matches one of the two documented shapes (`WROTE` + a stat line, or `FAIL` + a reason; a diff body, a `=== ` header, an `OK ` tail or an internal temp filename is flagged as a mismatch), whether a successful result repeats the call's own `file_path` (the regression this shape exists to prevent), and whether a result exceeds `--cap` (1024 B by default). Results from before this shape landed are reported separately as legacy |
-| `tools/audit-session.mjs --tools` | Switches the view: every real session log prints each `request/header` event's actual tool table with a verdict line (`native write/edit: PRESENT (...)` vs `masked`, plus whether `edit_text` / `write_text` are present) and a summary. That table is the truth about what the model was offered, so it is the only acceptance check for whether the mask took effect: `node tools/audit-session.mjs --tools` |
-| `tools/gen-schema.mjs` | Needs an installed `@deepseek-ai/dsh-tools`: it looks for one under the dsh profile's `node_modules` and under the npm global prefix, and `DSH_TOOLS_ENTRY` overrides that lookup. It exits 2 when it cannot find one |
+| `tools/measure-context.mjs` | Drives `apply()` on a simulated context through the real `execute()` → `render()` path, printing input bytes, model-visible bytes, ratio and line count per scenario. `--cap N` exits 1 when a scenario exceeds N bytes; `--static` prints the per-request overhead; `--vs-native` adds the same figures for the host's `write` / `edit` (SKIP without a dsh installation). `--static --vs-native` is the source of the masking figures above |
+| `tools/audit-session.mjs` | Reconciles real session logs (`<DSH_HOME>/sessions/`, multi-frame zstd) per call: whether each result matches one of the two documented shapes (`WROTE` + a stat line, or `FAIL` + a reason), whether a success repeats the call's own `file_path`, and whether a result exceeds `--cap` (1024 B by default). Results from before this shape landed are reported separately as legacy. `--tools` switches to the tool-table view described above |
+| `tools/gen-schema.mjs` | Checks that the embedded schemas still match the author DSL in the same file. Needs an installed `@deepseek-ai/dsh-tools` (`DSH_TOOLS_ENTRY` overrides the lookup); exit 2 without one |
 
 ## Layout
 
@@ -298,7 +282,6 @@ tools/check-license.mjs  # license / dependency / Node-only hygiene gate
 tools/gen-schema.mjs     # authoritative source and checker for the embedded JSON Schemas
 tools/measure-context.mjs  # per-scenario model-visible bytes + the native-tool comparison
 tools/audit-session.mjs  # real session logs: text-shape reconciliation + the --tools tool-table view
-HANDOVER.md              # internal dev handover: findings, evidence, open work, operations
 ```
 
 ## License
