@@ -8,6 +8,6 @@ node_modules/
 Thumbs.db
 desktop.ini
 
-# dsh 自测留下的临时工作区（正常情况下会在临时目录里，这里是兜底）
+# 自测临时工作区（兜底；常规落在系统临时目录）
 .dsh/
 .tmp-live

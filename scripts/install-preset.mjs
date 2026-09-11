@@ -2,32 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Flotiarenor
 // SPDX-License-Identifier: Apache-2.0
 /**
- * install-preset.mjs —— 把 `edit_text` / `write_text` 装成一个**用户 preset**。
+ * install-preset.mjs —— 把 `edit_text` / `write_text` 装成一个用户 preset：读本机 dsh 自带的 preset 组合
+ * （默认 `standard`），插入 `tool-text-editor` 行，连同 `preset/preset.yml` 写到
+ * `<DSH_HOME>/.agent-presets/<id>/`。
  *
- * 做法：读**本机 dsh 自带的 preset 组合**（默认 `standard`），把 `tool-text-editor` 那一行插进去，
- * 再连同本仓库的 `preset/preset.yml` 写到 `<DSH_HOME>/.agent-presets/<id>/`。
+ * 组合必须从用户自己的 dsh 派生，不在仓库里放拷贝：自带组合是别人（MIT, Copyright (c) 2026 DeepSeek）的
+ * 作品，随包分发要连带履行其署名义务。
  *
- * 为什么不在仓库里放一份 preset 组合的拷贝：
- *   * dsh 自带的组合是**别人（MIT, Copyright (c) 2026 DeepSeek）的作品**，随包分发它就要连带履行
- *     它的署名义务，而这份拷贝与本插件的功能无关；
- *   * 从用户自己的 dsh 里取，preset 自然跟着他装的 dsh 版本走 —— 不会像拷贝那样随 dsh 升级而过期。
- *
- * 用法：
- *   node scripts/install-preset.mjs                      # 默认 --id texteditor --base standard
- *   node scripts/install-preset.mjs --id my-edit --base minimal
- *   node scripts/install-preset.mjs --from <path-to-agent.cordis.yml>   # 自己指定源组合
- *   node scripts/install-preset.mjs --force              # 覆盖已存在的 preset（只覆盖两个文件）
- *   node scripts/install-preset.mjs --dry-run            # 只打印会做什么，不落盘
- *   node scripts/install-preset.mjs --mask-native        # 额外插入屏蔽原生 write/edit 的门禁行
- *   node scripts/install-preset.mjs --mask-native --escape   # 门禁 + native_edit/native_write 逃生口
- *
- * `--mask-native` 会多插一行 `tool-native-edit-mask`（`lib/mask.mjs`），并给编辑行写
- * `guidance: short`：这个 preset 的会话里，原生 `write`/`edit` 既不出现在工具表里也调不动，
- * 两段原生引导也被空段遮蔽（原生那一对约 2.4 KB/请求不再下发）。其它 preset 的会话不受影响，可作对照组。
- * 净账（含本插件自己的两个 schema）用 `node tools/bench-tokens.mjs` 量。
- *
- * `--escape` 给门禁行加 `escape: true`：原生名字仍不可见，但执行体以 `native_edit`/`native_write`
- * 回到该 agent 的作用域，便于随时对照原生行为；代价是两张 schema 重新下发（实测约 493 token/请求）。
+ * 用法：`node scripts/install-preset.mjs [--id <id>] [--base <id>] [--from <组合路径>] [--force] [--dry-run]
+ * [--mask-native]`；`--id` 默认 `texteditor`，`--base` 默认 `standard`。
  *
  * 退出码：0 成功，1 失败，2 用法错误 / 找不到 dsh 自带的 preset 组合。
  */
@@ -43,11 +26,9 @@ const PLUGIN = join(REPO, 'lib', 'editor.mjs').replace(/\\/g, '/')
 const MASK = join(REPO, 'lib', 'mask.mjs').replace(/\\/g, '/')
 const META = join(REPO, 'preset', 'preset.yml')
 /**
- * dsh 自带 preset 组合在 `node_modules` 里的布局，按版本从上到下试：
- *   * `@deepseek-ai/dsh/config/agent-presets/<base>/` —— ≤ 0.1.0-rc.6 的布局（本脚本最初就是照它写的）；
- *   * `@deepseek-ai/dsh-agent-presets/presets/<base>/` —— 0.1.5-rc.2 起自带组合搬进了**另一个包**
- *     （该包用 `SHIPPED_PRESET_ROOT = new URL('../presets/', import.meta.url)` 自己定位），
- *     旧路径 `@deepseek-ai/dsh/config` 在新版里已经不存在。
+ * 自带 preset 组合的两种布局（按版本从上到下试）：`@deepseek-ai/dsh/config/agent-presets/<base>/`
+ * （≤ 0.1.0-rc.6）与 `@deepseek-ai/dsh-agent-presets/presets/<base>/`（0.1.5-rc.2 起自带组合搬进另一个
+ * 包，该包按 `new URL('../presets/', import.meta.url)` 定位，旧路径在新版里已不存在）。
  */
 const SHIPPED_LAYOUTS = [
   ['dsh', 'config', 'agent-presets'],
@@ -67,25 +48,22 @@ function flagValue(name) {
 }
 
 /**
- * dsh 可能装在任何位置，所以按布局枚举"自带 preset 组合"的候选路径（不写死本机路径）：
- *   1. `--from` / `DSH_PRESET_SOURCE` —— 显式指定，任何布局都能用；
- *   2. dsh profile 的 node_modules（`<DSH_HOME|~/.dsh>/profiles/node_modules`）；
- *   3. npm 全局前缀下的 node_modules（Windows `%APPDATA%\npm`；POSIX `/usr/local/lib`、
- *      `/usr/lib`、`~/.npm-global/lib`）。
- * @param base - 自带 preset 的 id（standard / code / cordis / minimal）。
- * @returns 候选绝对路径（按优先级）。
+ * 枚举自带 preset 组合的候选路径（dsh 可能装在任何位置，故不写死本机路径）：`--from` /
+ * `DSH_PRESET_SOURCE` → profile 的 node_modules（`<DSH_HOME>` 与默认 `~/.dsh` 都试：`DSH_HOME` 可能被指到
+ * 别处如临时目录，而 dsh 本体仍在默认 home 下）→ npm 全局前缀。
+ * @param explicitPath - 显式指定的源组合（已确认存在）。
  */
-function findCompositions(base) {
-  const candidates = []
-  const explicit = flagValue('--from') ?? process.env.DSH_PRESET_SOURCE
-  if (typeof explicit === 'string' && explicit !== '') candidates.push(resolve(explicit))
+function findCompositions(base, explicitPath, dshHome) {
+  const candidates = explicitPath === undefined ? [] : [explicitPath]
   const add = (nodeModules) => {
-    if (typeof nodeModules !== 'string' || nodeModules === '') return
+    if (nodeModules === '') return
     for (const layout of SHIPPED_LAYOUTS) {
       candidates.push(join(nodeModules, '@deepseek-ai', ...layout, base, COMPOSITION))
     }
   }
-  add(join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'profiles', 'node_modules'))
+  for (const home of new Set([dshHome, join(homedir(), '.dsh')])) {
+    add(join(home, 'profiles', 'node_modules'))
+  }
   const globalRoots = process.platform === 'win32'
     ? [process.env.APPDATA === undefined ? '' : join(process.env.APPDATA, 'npm', 'node_modules')]
     : ['/usr/local/lib/node_modules', '/usr/lib/node_modules', join(homedir(), '.npm-global', 'lib', 'node_modules')]
@@ -94,107 +72,64 @@ function findCompositions(base) {
 }
 
 /**
- * 我们插进组合里的那一段（只有这一段是我们自己的文字 + 行）。
+ * 插进组合里的那一段（只有这一段是本仓库自己的文字与行）。
  * @param sourcePath - 源组合路径（写进注释，便于升级后重跑）。
- * @param maskNative - 是否同时插入"屏蔽原生 write/edit"的门禁行，并让编辑行改用短引导。
- * @param escape - 门禁行是否带 `escape: true`（原生执行体以 `native_edit` / `native_write` 保留）。
+ * @param maskNative - 是否插入屏蔽原生 write/edit 的门禁行，并让编辑行改用短引导。
+ * @returns 插件段文本（以单个换行结尾）。
  */
-function pluginBlock(sourcePath, maskNative, escape = false) {
-  const editorTail = [
+function pluginBlock(sourcePath, maskNative) {
+  const lines = [
+    '# ── 字节保真的文本编辑工具（edit_text / write_text）─────────────────────────',
+    '#',
+    '# 原生 `edit` / `write` 都会丢 UTF-8 BOM，且不还原文件自身的行尾（往 CRLF 文件写 LF 内容就变成 LF）；',
+    '# 原生 `edit` 还只做精确匹配（`old_string` 差一个空格就报 FS_EDIT_NOT_FOUND）。本行两个工具保 BOM 与文件',
+    '# 自身行尾，精确失败时按行块相似度回退并给出最接近的候选。read-only 会话下在任何 I/O 之前拒写；模型可见',
+    '# 文本只有一行统计。',
+    '#',
+    ...(maskNative
+      ? ['# 原生 `edit`/`write` 由下面的门禁行按 agent 作用域屏蔽，本行因此改用 `guidance: short`。']
+      : ['# 原生 `edit`/`write` 保留不动：注册的是两个不同名工具，同一层不会同名冲突（回退：给本行加',
+        '# `disabled: true`，或整行删掉）。']),
+    '#',
+    '# 由 `scripts/install-preset.mjs` 从本机 dsh 自带的 preset 组合派生：',
+    `#   ${sourcePath}`,
+    '# 行名写绝对路径：preset 行的裸包名由宿主组装基址解析，模块内部的裸 import 由 Node 按文件真实路径解析，',
+    '# 而 preset 目录下没有 node_modules —— 该插件刻意零依赖（只用 node: 内置模块），可放任何位置。',
+    '#',
     '# 可选 config（插件没有 Config schema，字段原样透传）：',
-    '#   backup / ledger: boolean   默认都 true（备份到 artifactsDir/backups，台账 artifactsDir/edits.log）',
-    '#   artifactsDir: <路径>       默认 <会话工作区>/.dsh',
     '#   newFileBom: boolean        默认 false（新建文件是否写 BOM）',
-    '#   context: number            diff 上下文行数，默认 3',
     '#   root: <路径>               没有 agent 会话时的回退工作区',
-    '#   guidance: full|short|false 默认 full；short 去掉"优先于原生"那半句（原生已被下面的门禁屏蔽）',
+    '#   guidance: full|short|false 默认 full；short 去掉"优先于原生"那半句',
     '- id: tool-text-editor',
     `  name: '${PLUGIN}'`,
-    ...(maskNative
-      ? ['  config:', '    guidance: short']
-      : []),
-    '',
+    ...(maskNative ? ['  config:', '    guidance: short'] : []),
   ]
-  const maskLines = maskNative
-    ? [
+  if (maskNative) {
+    lines.push(
       '',
       '# ── 屏蔽原生的 write / edit（每个 agent 的作用域）──────────────────────────',
       '#',
-      '# 原生两个工具即便有上面那对工具也仍在工具表里，每次请求要付 1754 B 的两个 schema 加 608 B 的',
-      '# 两段引导，而它们存在的唯一作用就是让模型**别**用原生工具。这一行把它按 agent 作用域收窄——',
-      '# 三条通路任何一条先到就先收窄（0.1.5-rc.2 之后重写过：早先只挂 `agent/created`，而 GUI 是',
-      '# "先建 agent、后换 preset"，重挂是父级 re-link，那个事件早就发完了）：',
-      '#   * `apply` 阶段就挂守卫：与创建顺序无关，第一次直呼原生工具就被否决（原因里点名 edit_text /',
-      '#     write_text），并顺手收窄，于是下一次请求的工具表就干净了；',
-      '#   * `agent/created`：建档时就加入本 preset 的 agent（含 subagent）立即收窄；',
-      '#   * `tools/change`：换 preset 时 `recompose()` 会发它，此时枚举活 agent，把属于本组合的收窄；',
-      '#     反方向换出去的 agent 会被成对撤销，不会卡成"一个写工具都没有"。',
+      '# 原生两个工具仍在工具表里：每次请求付 1754 B 的两个 schema 加 608 B 的两段引导，只为劝模型别用它们。',
+      '# 本行按 agent 作用域收窄，三条通路任一条先到就先收窄（早先只挂 `agent/created`，而 GUI 是"先建 agent、',
+      '# 后换 preset"，重挂是父级 re-link，那个事件早已发完）：',
+      '#   * `apply` 阶段就挂守卫：与创建顺序无关，第一次直呼原生工具即被否决并顺手收窄；',
+      '#   * `agent/created`：建档时收窄本 preset 的 agent（含 subagent）；',
+      '#   * `tools/change`：换 preset 时 `recompose()` 发它，此时枚举活 agent 收窄属于本组合的，反向换出的成对撤销。',
       '#',
-      '# 收窄用的是 `agent.ctx.tools.restrict({ deny })`：注册表只有一套可见性解析器，schema 下发、查找',
-      '# 与派发读同一张视图，所以被拒的名字既不出现在工具表里，也调不动（直呼得到 UNKNOWN_TOOL）；',
-      '# 另外在更近的层注册同名**空段**遮蔽 tool:write / tool:edit 引导（0.1.5-rc.2 起那段引导自己就按',
-      '# 可见性求值了，空段只是冗余的保险）。',
-      '#',
-      '# 只影响选了本 preset 的会话：其它 preset 与 profile 层的会话里原生工具照旧可用（天然的对照组，',
-      '# 想随时观察或对比原生行为就用那边的新会话）。',
-      '#',
-      '# 只写模型看不见的名字才安全：门禁只点名"本 agent 真的看得见"的工具，preset 没挂 tool-fs 时不会',
-      '# 因未知名字抛错（归属判据本身也不靠名字，靠探测对象的身份）。`mode: guard` 可换成"工具保持可见、',
-      '# 调用被否决"：想留观察窗时用它，schema 的钱照付、两段引导仍被空段遮蔽；`sections: []` 则保留原生',
-      '# 那两段引导文字。',
-      '#',
-      '# 回退：删掉这一行（或给编辑行加 `guidance: full` 恢复原引导段）。',
-      ...(escape
-        ? [
-          '#',
-          '# `escape: true`：原生**名字**仍然看不见（直呼 `edit` / `write` 得到 UNKNOWN_TOOL），但执行体以',
-          '# `native_edit` / `native_write` 回到本 agent 自己的作用域 —— 想对照或观察原生行为时不必换会话。',
-          '# 代价是这两张 schema 重新下发（实测约 1.9 KB ≈ 493 token/请求，见 `node tools/bench-tokens.mjs`）。',
-        ]
-        : []),
+      '# 收窄用 `agent.ctx.tools.restrict({ deny })`：注册表只有一套可见性解析器，被拒的名字既不在工具表里也调不动',
+      '# （直呼得到 UNKNOWN_TOOL）；另注册同名空段遮蔽 tool:write / tool:edit 引导。只影响选了本 preset 的会话，',
+      '# 其它 preset 照旧可用（天然对照组）；只点名本 agent 真的看得见的工具，归属判据靠探测对象的身份。',
+      '# `mode: guard` 改为"可见但拒绝"，`sections: []` 保留那两段引导；回退：删掉本行或给编辑行加',
+      '# `guidance: full`。',
       '- id: tool-native-edit-mask',
       `  name: '${MASK}'`,
-      ...(escape ? ['  config:', '    escape: true'] : []),
-      '',
-    ]
-    : []
-  return [
-    '# ── 字节保真的文本编辑工具（edit_text / write_text）─────────────────────────',
-    '#',
-    '# 存在理由（三条）：原生 `write` 丢掉 UTF-8 BOM 并把 CRLF 文件改写成 LF，原生 `edit` 也丢 BOM，',
-    '# 且只做精确匹配（`old_string` 差一个空格就报 FS_EDIT_NOT_FOUND）。这两个工具保住 BOM 与行尾，',
-    '# 用"精确 → 宽松 → 最接近候选"匹配，并带上落盘前备份、编辑台账与 grep/lines 锚点。',
-    '#',
-    '# 模型可见文本只有一行统计：既不回显改动内容（调用方刚发过 new_text），也不回显路径（结果与调用',
-    '# 一一绑定，file_path 就在参数里）。"哪个文件、改了什么"由呈现通道承担——presentCall /',
-    '# presentationMeta / presentResult 给 GUI 画 diff 卡片，载荷有上限且不进模型上下文。',
-    '#',
-    '# read-only 会话下两个工具都在任何 I/O 之前拒写：写盘绕开 ctx.fs，这条路径上没有第二个强制点，',
-    '# 所以插件把宿主 sandboxPolicy 里唯一禁止写入的那一档镜像了回来（其余模式仍按常量护栏）。',
-    '#',
-    '# 实现是**进程内 Node**：零依赖、零外部运行时、每次调用没有进程启动开销（不启动任何解释器或',
-    '# 外部命令）。',
-    '#',
-    ...(maskNative
-      ? ['# 原生 `edit`/`write` 由下面的门禁行按 agent 作用域屏蔽（本行自己也就不再需要"优先于原生"那',
-        '# 半句引导，见编辑器行的 `guidance: short`）。']
-      : ['# 原生 `edit`/`write` **保留不动**：本行注册的是两个**不同名**工具，同一层不会同名冲突，',
-        '# 想回退只需给这一行加 `disabled: true`（或整行删掉）。']),
-    '#',
-    '# 本文件由 `scripts/install-preset.mjs` 生成：源 = 本机 dsh 自带的 preset 组合',
-    `#   ${sourcePath}`,
-    '# 行名写的是本仓库 `lib/editor.mjs` 的绝对路径 —— preset 行的**裸包名**会从宿主组装基址解析，',
-    '# 但模块**内部的**裸 import 由 Node 按文件真实路径解析，而 preset 目录下没有 node_modules，',
-    '# 所以该插件刻意零依赖（只用 node: 内置模块），可以放在任何位置。',
-    '#',
-    '# 该插件消费宿主服务（tools / systemPrompt），不发布任何服务，因此不需要 isolate realm。',
-    '#',
-    ...editorTail,
-    ...maskLines,
-  ].join('\n')
+    )
+  }
+  lines.push('')
+  return lines.join('\n')
 }
 
-/** 插入位置：dsh 自带组合里"文件系统"之后、"后台任务"之前；找不到锚点就追加到末尾。 */
+/** 插入位置：自带组合里"文件系统"之后、"后台任务"之前；找不到锚点就追加到末尾。 */
 const ANCHORS = [
   { pattern: /^# ── background jobs/m, label: 'background jobs 段之前' },
   { pattern: /^- id: tool-jobs$/m, label: 'tool-jobs 行之前' },
@@ -205,11 +140,11 @@ const ANCHORS = [
  * @returns `{ text, anchor }`
  * @throws {Error} 源组合看起来已经打过补丁时。
  */
-function inject(source, sourcePath, maskNative, escape) {
+function inject(source, sourcePath, maskNative) {
   if (/^- id: tool-text-editor$/m.test(source)) {
     throw new Error('源组合里已经有 tool-text-editor 行了 —— 请指向 dsh 自带的原始组合')
   }
-  const block = pluginBlock(sourcePath, maskNative, escape)
+  const block = pluginBlock(sourcePath, maskNative)
   for (const { pattern, label } of ANCHORS) {
     const match = pattern.exec(source)
     if (match !== null) {
@@ -221,15 +156,18 @@ function inject(source, sourcePath, maskNative, escape) {
   return { text: source + separator + block, anchor: '文件末尾' }
 }
 
-// ── 参数与前置检查 ──────────────────────────────────────────────────────────
+// ── 参数与前置检查 ──
 
 const id = flagValue('--id') ?? 'texteditor'
 const base = flagValue('--base') ?? 'standard'
 const force = process.argv.includes('--force')
 const dryRun = process.argv.includes('--dry-run')
 const maskNative = process.argv.includes('--mask-native')
-const escape = process.argv.includes('--escape')
-const fromFlag = flagValue('--from')
+/** `--from` / `DSH_PRESET_SOURCE`：显式源组合，给定时不再枚举自带布局。 */
+const explicitSource = (flagValue('--from') ?? process.env.DSH_PRESET_SOURCE ?? '').trim()
+const explicitPath = explicitSource === '' ? undefined : resolve(explicitSource)
+/** 生效的用户目录：`DSH_HOME` 非空则用它，否则 `~/.dsh`。 */
+const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
 
 if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
   console.error('FAIL preset id 必须是 [a-z0-9][a-z0-9-]*（会作为目录名），收到：' + id)
@@ -237,10 +175,6 @@ if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
 }
 if (!/^[a-z0-9][a-z0-9-]*$/.test(base)) {
   console.error('FAIL --base 必须是 dsh 自带 preset 的 id（如 standard / minimal / cordis / ptc），收到：' + base)
-  process.exit(2)
-}
-if (escape && !maskNative) {
-  console.error('FAIL --escape 只对 --mask-native 有意义（它加在门禁行上）。')
   process.exit(2)
 }
 if (!existsSync(PLUGIN)) {
@@ -255,8 +189,12 @@ if (!existsSync(META)) {
   console.error('FAIL 找不到 preset 元数据：' + META)
   process.exit(1)
 }
+if (explicitPath !== undefined && !existsSync(explicitPath)) {
+  console.error('FAIL --from / DSH_PRESET_SOURCE 指向的组合不存在：' + explicitPath)
+  process.exit(2)
+}
 
-const candidates = findCompositions(base)
+const candidates = findCompositions(base, explicitPath, dshHome)
 const sourcePath = candidates.find((candidate) => existsSync(candidate))
 if (sourcePath === undefined) {
   console.error(`FAIL 找不到本机 dsh 自带的 preset 组合（--base ${base}）；试过：`)
@@ -268,40 +206,32 @@ if (sourcePath === undefined) {
 const source = readFileSync(sourcePath, 'utf8')
 let injected
 try {
-  injected = inject(source, sourcePath, maskNative, escape)
+  injected = inject(source, sourcePath, maskNative)
 } catch (error) {
   console.error('FAIL ' + error.message)
   process.exit(2)
 }
 
 /**
- * 写出去的 `preset.yml` 要跟**实际组合**一致。
- *
- * `preset/preset.yml` 是仓库里那份与模式无关的文字，而这一行状态是随 `--mask-native` / `--escape`
- * 变的：旧版脚本原样拷贝，于是开着门禁的 preset 描述里也一直写着"原生 edit/write 保持不变"。
- * @returns 补上状态句的元数据文本。
+ * 写出的 `preset.yml` 必须与实际组合一致：仓库那份与模式无关，而"原生工具是否被屏蔽"随 `--mask-native` 变
+ * （旧版原样拷贝，开着门禁的描述里也写着"原生 edit/write 保持不变"）。状态句接在 `preset/preset.yml` 的最后
+ * 一行 `description:` 之后；它是 YAML 纯标量，不能出现 `: ` 或 ` #`。
  */
 function metadataText() {
-  const head = readFileSync(META, 'utf8').trimEnd()
-  const tail = maskNative
-    ? (escape
-      ? '；原生 `edit`/`write` 已被门禁行按 agent 作用域屏蔽，执行体以 `native_edit`/`native_write` 保留（`escape: true`）。'
-      : '；原生 `edit`/`write` 已被门禁行按 agent 作用域屏蔽：既不出现在工具表里，也调不动。')
+  const state = maskNative
+    ? '；原生 `edit`/`write` 已被门禁行按 agent 作用域屏蔽：既不出现在工具表里，也调不动。'
     : '；原生 edit/write 保持不变。'
-  return head + tail + '\n'
+  return readFileSync(META, 'utf8').trimEnd() + state + '\n'
 }
 
-const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-  ? process.env.DSH_HOME.trim()
-  : join(homedir(), '.dsh')
 const targetDir = join(dshHome, '.agent-presets', id)
 const targetComposition = join(targetDir, COMPOSITION)
 const targetMeta = join(targetDir, 'preset.yml')
 
 console.log('仓库        : ' + REPO)
 console.log('插件        : ' + PLUGIN)
-if (maskNative) console.log('门禁        : ' + MASK + `（屏蔽原生 write/edit${escape ? ' + native_edit/native_write 逃生口' : ''}，编辑行 guidance: short）`)
-console.log('源组合      : ' + sourcePath + (fromFlag === undefined && process.env.DSH_PRESET_SOURCE === undefined ? `（--base ${base}）` : ''))
+if (maskNative) console.log('门禁        : ' + MASK + '（屏蔽原生 write/edit，编辑行 guidance: short）')
+console.log('源组合      : ' + sourcePath + (explicitPath === undefined ? `（--base ${base}）` : ''))
 console.log('插入位置    : ' + injected.anchor)
 console.log('DSH_HOME    : ' + dshHome)
 console.log('目标 preset : ' + targetDir)
@@ -314,10 +244,10 @@ if (dryRun) {
   console.log('  ' + targetComposition + `（源组合 ${source.split('\n').length} 行 + 插件段）`)
   console.log('  ' + targetMeta)
   if (exists && !force) {
+    // 只预告冲突：dry-run 不落盘，退出码按契约仍为 0。
     console.error('')
     console.error('[dry-run] 但目标已存在，真跑会被拒绝：' + targetComposition)
     console.error('          要覆盖请加 --force（只覆盖 agent.cordis.yml 与 preset.yml，同目录其它文件不动）。')
-    process.exit(1)
   }
   process.exit(0)
 }

@@ -3,26 +3,15 @@
 /**
  * measure-context.mjs —— 测量两个工具进入模型上下文的字节数。
  *
- * 工具结果按追加方式进入会话历史，单次调用返回的字节数是本插件的核心指标。本脚本把
- * `lib/editor.mjs` 的 `apply()` 挂到模拟 ctx 上，走真实的 `execute()` → `output.render()` 路径
- * （宿主即如此调用），逐场景输出：
+ * 把 `lib/editor.mjs` 的 `apply()` 挂到模拟 ctx 上，走真实的 `execute()` → `output.render()` 路径（宿主即如此
+ * 调用），逐场景输出：入参字节 | 模型可见字节 | 倍率 | 行数。契约是"模型可见文本与输入规模无关"，场景集因此
+ * 覆盖大文件、单行压缩文件、宽数据行、超长单行替换与失败路径（未命中 / 目录目标）。
  *
- *   入参字节 | 模型可见字节 | 倍率 | 行数
- *
- * 契约是"模型可见文本与输入规模无关"：成功路径固定为 `WROTE` 加一行统计，因此场景集特意
- * 覆盖大文件、压缩为单行的大文件、宽数据行、超长单行的替换，以及失败路径（歧义 / 目录目标 /
- * 补齐父目录）。
- *
- * 仅在临时目录中作业，不修改仓库文件。零依赖，只用 `node:` 内置模块。
- *
- * 用法：
- *   node tools/measure-context.mjs                 # 打印矩阵
- *   node tools/measure-context.mjs --cap 2048      # 任一场景模型可见字节 > 上限 → 退出码 1
- *   node tools/measure-context.mjs --static        # 只量静态开销（描述 / schema / 引导段）
- *   node tools/measure-context.mjs --vs-native     # 追加宿主自带 write / edit 的同一组数据
- *
- * `--vs-native` 需要一个装有 `@deepseek-ai/dsh-tool-fs` 的 dsh：入口按常见布局去找，也可以用
- * `DSH_TOOL_FS_ENTRY` 显式指定；找不到时打印 SKIP，退出码不变（不是失败，只是没跑成）。
+ * 用法：node tools/measure-context.mjs [--cap N] [--static] [--vs-native]
+ *   --cap N      任一场景的模型可见字节 > N 即退出码 1（`npm test` 用它守住 2 KB 预算）
+ *   --static     只量静态开销（引导段 / 描述 / schema），不跑场景
+ *   --vs-native  追加宿主自带 `write` / `edit` 的静态开销；找不到 dsh 时打印 SKIP，退出码不变
+ * 退出码 2 = `--cap` 不是字节数。仅在临时目录作业；零依赖，只用 `node:` 内置模块。
  */
 
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
@@ -41,7 +30,13 @@ const flagValue = (name, fallback) => {
 const CAP = Number(flagValue('--cap', 'NaN'))
 const bytes = (value) => Buffer.byteLength(value ?? '', 'utf8')
 
-/** 注册一遍工具（每次都用干净的注册表，避免配置串味）。 */
+// 缺省 `--cap` 不设上限；值不是字节数必须报错，否则门禁静默失效。
+if (hasFlag('--cap') && (!Number.isFinite(CAP) || CAP < 0)) {
+  console.error(`FAIL --cap 需要一个非负字节数，收到 ${JSON.stringify(flagValue('--cap', ''))}`)
+  process.exit(2)
+}
+
+/** 每次都用干净的注册表注册一遍工具。 */
 function makeTools(config = {}) {
   const registered = []
   apply(
@@ -51,21 +46,19 @@ function makeTools(config = {}) {
   return new Map(registered.map((tool) => [tool.name, tool]))
 }
 
-/** 一个场景：跑一次工具，量出入参与模型可见文本。 */
-async function probe(label, toolName, args, config) {
-  const tools = makeTools(config)
-  const tool = tools.get(toolName)
+async function probe(label, toolName, args) {
+  const tool = makeTools().get(toolName)
   const value = await tool.execute(args, { agent: { session: { header: { cwd: args.__ws } } } })
   const rendered = tool.output.render(args, value)
   const visible = rendered.map((block) => block.text ?? '').join('')
+  const visibleBytes = bytes(visible)
   const argBytes = bytes(JSON.stringify({ ...args, __ws: undefined }))
   return {
     label,
     tool: toolName,
-    ok: value.ok,
     argBytes,
-    visibleBytes: bytes(visible),
-    ratio: argBytes === 0 ? 0 : bytes(visible) / argBytes,
+    visibleBytes,
+    ratio: argBytes === 0 ? 0 : visibleBytes / argBytes,
     lines: visible === '' ? 0 : visible.split('\n').length,
     firstLine: visible.split('\n')[0].slice(0, 44).replace(/\s+/g, ' '),
   }
@@ -73,7 +66,7 @@ async function probe(label, toolName, args, config) {
 
 const long = (n) => 'x'.repeat(n)
 
-/** 场景表：每个函数拿到工作区，返回探针入参。 */
+/** 场景表：函数拿到工作区，返回探针入参。 */
 const SCENARIOS = [
   ['write: 45 lines', 'write_text', (ws) => ({
     __ws: ws,
@@ -136,12 +129,7 @@ const SCENARIOS = [
   })],
 ]
 
-/**
- * 静态开销：请求里每次都带的那部分（可前缀缓存，但仍占预算）。
- *
- * 顺带量出引导段三档的字节数：`full`（默认，含"优先于原生"）、`short`（原生已被门禁屏蔽时用）、
- * `off`（不注册）。
- */
+/** 每个请求都要带的静态开销（可前缀缓存，但仍占预算）；顺带量引导段三档（`full` / `short` / `off`）。 */
 async function staticReport() {
   const registered = []
   const guidanceOf = (config) => {
@@ -156,12 +144,9 @@ async function staticReport() {
     return text
   }
   const guidance = guidanceOf({})
-  let total = 0
+  let total = bytes(guidance)
   console.log('=== static overhead (sent with every request)')
-  for (const [label, text] of [['system prompt section', guidance]]) {
-    total += bytes(text)
-    console.log(`  ${String(bytes(text)).padStart(6)} B  ${label}`)
-  }
+  console.log(`  ${String(total).padStart(6)} B  system prompt section`)
   for (const tool of registered) {
     const description = bytes(tool.description)
     const schema = bytes(JSON.stringify(tool.parameters))
@@ -180,10 +165,7 @@ async function staticReport() {
   return total
 }
 
-/**
- * 查找宿主自带的 `dsh-tool-fs`，用于对照原生 `write` / `edit` 的静态开销。
- * 顺序：`DSH_TOOL_FS_ENTRY` → dsh profile 的 node_modules → npm 全局前缀。
- */
+/** 找一个宿主自带的 `dsh-tool-fs`：`DSH_TOOL_FS_ENTRY` → profile 的 `node_modules` → npm 全局前缀。 */
 function findToolFs() {
   const candidates = []
   const add = (root, nested) => {
@@ -201,10 +183,7 @@ function findToolFs() {
   return candidates.find((candidate) => existsSync(candidate))
 }
 
-/**
- * `dsh-system-prompt` 的段序号表里被工具行问到的那几条（顺序只影响打印出来的 `order=` 列，
- * 不影响本工具量的字节数；`applyReadTool` 注册时会问 `TOOL_READ`，缺了它那一行会直接抛）。
- */
+/** `applyReadTool` 注册时会问 `getSectionOrder('TOOL_READ')`，缺了直接抛；数值只影响打印的 `order=`。 */
 const SECTION_ORDERS = {
   TOOL_BASH: 1000,
   TOOL_PWSH: 1010,
@@ -215,19 +194,12 @@ const SECTION_ORDERS = {
   TOOL_GREP: 1500,
 }
 
-/**
- * 渲染一个引导段：0.1.5-rc.2 起 `dsh-tool-fs` 把 `tool:read` / `tool:write` / `tool:edit` 的文本写成
- * `({ scope }) => ctx.tools.get(name, scope) === void 0 ? '' : '…'`，所以直接 `bytes(section.text)`
- * 量到的是函数源码而不是引导文字。
- * @param section - 注册表交回来的段对象。
- * @param scope - 求值用的作用域（`--vs-native` 量的是"原生工具可见"那一档）。
- * @returns 段文本。
- */
+/** 0.1.5-rc.2 起原生引导段的 `text` 是 `({ scope }) => …` 函数，直接量 `section.text` 量到的是函数源码。 */
 function sectionText(section, scope) {
   return typeof section.text === 'function' ? section.text({ scope }) : section.text
 }
 
-/** 原生 write / edit 的静态开销（沙箱升权字段随组合出现，这里按"有沙箱"计）。 */
+/** 原生 `write` / `edit` 的静态开销（升权字段按"有沙箱"计）。 */
 async function nativeReport() {
   const entry = findToolFs()
   if (entry === undefined) {
@@ -239,9 +211,8 @@ async function nativeReport() {
   const sections = []
   const scope = { kind: 'scope' }
   const sandboxCtx = {
-    // 最小壳上下文也得提供工具行真正用到的那两样：`section` 与 `getSectionOrder`（缺后者会在
-    // `applyReadTool` 里抛 "ctx.systemPrompt.getSectionOrder is not a function"），
-    // 外加一个"原生工具对这个作用域可见"的 `tools.get`，好让按可见性求值的引导段渲染出完整文本。
+    // 壳上下文要提供 `section` / `getSectionOrder`（缺后者 `applyReadTool` 抛错），以及一个"原生工具可见"的
+    // `tools.get`，否则按可见性求值的引导段渲染为空。
     tools: {
       register: (tool) => registered.push(tool),
       get: (name) => (name === 'read' || name === 'write' || name === 'edit' ? { name } : undefined),
@@ -278,7 +249,7 @@ async function nativeReport() {
   console.log(`  => masking both (lib/mask.mjs) removes ${schemaTotal + sectionTotal} B per request`)
 }
 
-// ── 跑起来 ──────────────────────────────────────────────────────────────────
+// ── 跑起来 ──
 
 if (hasFlag('--static') || hasFlag('--vs-native')) {
   await staticReport()
@@ -288,27 +259,31 @@ if (hasFlag('--static') || hasFlag('--vs-native')) {
 
 const ws = mkdtempSync(join(tmpdir(), 'dsh-measure-context-'))
 const rows = []
-for (const [label, toolName, build] of SCENARIOS) {
-  rows.push(await probe(label, toolName, build(ws)))
-}
+try {
+  for (const [label, toolName, build] of SCENARIOS) {
+    rows.push(await probe(label, toolName, build(ws)))
+  }
 
-console.log('scenario                                   tool        args   visible   ratio  lines  result')
-for (const row of rows) {
-  console.log(
-    row.label.padEnd(41) + '  ' + row.tool.padEnd(10)
-    + String(row.argBytes).padStart(7) + ' ' + String(row.visibleBytes).padStart(8)
-    + '  ' + row.ratio.toFixed(3).padStart(5) + 'x' + String(row.lines).padStart(6) + '  ' + row.firstLine,
-  )
-}
+  console.log('scenario                                   tool        args   visible   ratio  lines  result')
+  for (const row of rows) {
+    console.log(
+      row.label.padEnd(41) + '  ' + row.tool.padEnd(10)
+      + String(row.argBytes).padStart(7) + ' ' + String(row.visibleBytes).padStart(8)
+      + '  ' + row.ratio.toFixed(3).padStart(5) + 'x' + String(row.lines).padStart(6) + '  ' + row.firstLine,
+    )
+  }
 
-const worst = rows.reduce((a, b) => (b.visibleBytes > a.visibleBytes ? b : a))
-const totalVisible = rows.reduce((sum, row) => sum + row.visibleBytes, 0)
-const totalArgs = rows.reduce((sum, row) => sum + row.argBytes, 0)
-console.log('')
-console.log(`worst single result : ${worst.visibleBytes} B  (${worst.label})`)
-console.log(`totals              : args ${totalArgs} B -> model-visible ${totalVisible} B  (${(totalVisible / totalArgs).toFixed(3)}x)`)
-console.log(`workspace           : ${ws}`)
-rmSync(ws, { recursive: true, force: true })
+  const worst = rows.reduce((a, b) => (b.visibleBytes > a.visibleBytes ? b : a))
+  const totalVisible = rows.reduce((sum, row) => sum + row.visibleBytes, 0)
+  const totalArgs = rows.reduce((sum, row) => sum + row.argBytes, 0)
+  console.log('')
+  console.log(`worst single result : ${worst.visibleBytes} B  (${worst.label})`)
+  console.log(`totals              : args ${totalArgs} B -> model-visible ${totalVisible} B  (${(totalVisible / totalArgs).toFixed(3)}x)`)
+  console.log(`workspace           : ${ws}`)
+} finally {
+  // 场景抛错也要删掉工作区。
+  rmSync(ws, { recursive: true, force: true })
+}
 
 if (Number.isFinite(CAP)) {
   const over = rows.filter((row) => row.visibleBytes > CAP)

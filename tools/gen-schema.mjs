@@ -3,21 +3,14 @@
 /**
  * gen-schema.mjs —— 内嵌 JSON Schema 的**权威来源与校验器**。
  *
- * 背景：`@deepseek-ai/dsh-tools` 的 `defineTool` 会把作者 DSL（`{ file_path: { type: 'string' } }`
- * 这种）转成真正的 JSON Schema。本插件刻意**零依赖**（`lib/editor.mjs` 不 import 任何包，这样
- * preset 行才能用绝对路径加载它），所以 schema 是**离线生成后内嵌**的。
+ * `lib/editor.mjs` 刻意零依赖（不 import 任何包，preset 行才能用绝对路径加载它），所以 schema 是**离线生成后
+ * 内嵌**的；本脚本用 dsh 自己的转换器把下面的作者 DSL 转一遍，再与内嵌那份逐字段比对：一致打印 OK，不一致打印
+ * 差异并退出码 1（可当 CI 门禁）。
  *
- * 这个脚本用 dsh 自己的转换器把下面的 DSL 转一遍，再和 `lib/editor.mjs` 里内嵌的那份逐字段比对：
- *   * 一致  → 打印 OK
- *   * 不一致 → 打印差异并退出码 1（可以当 CI 门禁）
+ * 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：入口按常见布局去找（见 `findDshTools`），也可用
+ * `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码 2（"这次没跑成"，不是 schema 漂移）。
  *
- * 它是**开发期**工具：需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh。入口不写死路径，而是按常见
- * 布局去找（见 `findDshTools`）；也可以用 `DSH_TOOLS_ENTRY` 显式指定。找不到入口时退出码 2，
- * 意思是"这次没跑成"，而不是 schema 漂移。
- *
- * 用法：
- *   node tools/gen-schema.mjs
- *   $env:DSH_TOOLS_ENTRY = '<path-to-dsh-tools>/lib/index.js'; node tools/gen-schema.mjs
+ * 用法：node tools/gen-schema.mjs
  */
 
 import { existsSync } from 'node:fs'
@@ -32,11 +25,8 @@ import {
 } from '../lib/editor.mjs'
 
 /**
- * dsh 可能装在任意位置，所以这里按布局枚举候选入口（不写死任何机器上的路径）：
- *   1. `DSH_TOOLS_ENTRY` —— 显式指定，任何布局都能用；
- *   2. dsh profile 的 `node_modules`（`<DSH_HOME|~/.dsh>/profiles/node_modules`）；
- *   3. npm 全局前缀下的 `node_modules`（Windows `%APPDATA%\npm`；POSIX `/usr/local/lib`、
- *      `/usr/lib`、`~/.npm-global/lib`）—— dsh-tools 既可能被提升到顶层，也可能嵌在 dsh 里。
+ * dsh 装在哪不定，故按布局枚举候选入口：`DSH_TOOLS_ENTRY` → dsh profile 的 `node_modules` → npm 全局前缀
+ * （不写死任何机器上的路径）。
  * @returns 候选入口的绝对路径列表（按优先级）。
  */
 function findDshTools() {
@@ -70,9 +60,9 @@ const {
   assertSupportedJsonSchema,
   parameterSchemaSpecToJsonSchema,
   valueSchemaSpecToJsonSchema,
-} = await import(ENTRY.startsWith('file:') ? ENTRY : pathToFileURL(ENTRY).href)
+} = await import(pathToFileURL(ENTRY).href)
 
-/** `edit_text` 的作者 DSL（改这里 → 跑本脚本 → 把输出贴回 lib/editor.mjs）。 */
+/** `edit_text` 的作者 DSL：改这里后跑本脚本，把输出贴回 `lib/editor.mjs`。 */
 const editParametersDsl = {
   file_path: { type: 'string', required: true, description: 'Target file; relative resolves against the session cwd.' },
   new_text: { type: 'string', required: true, description: 'Replacement / inserted text.' },
@@ -90,11 +80,7 @@ const writeParametersDsl = {
 }
 
 /**
- * 两个工具共用的规范返回值。
- *
- * 前四个字段是**模型通道**（`render` 只读它们）；`operation` / `hunks` / `hunksTruncated` 是**呈现通道**
- * （GUI diff 卡片）的载荷，只经 `presentationMeta` 投影进会话日志，不进模型上下文，因此都是可选的
- * ——失败值只有前四个字段，也仍然合法。
+ * 两个工具共用的规范返回值：四个字段全部是**模型通道**（`render` 只读它们），没有呈现层载荷。
  */
 const outputDsl = {
   type: 'object',
@@ -104,19 +90,6 @@ const outputDsl = {
     ok: { type: 'boolean', required: true },
     brief: { type: 'string', required: true },
     stderr: { type: 'string', required: true },
-    operation: { type: 'string', enum: ['create', 'update'] },
-    hunks: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          oldText: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
-          newText: { type: 'string', required: true },
-        },
-      },
-    },
-    hunksTruncated: { type: 'boolean' },
   },
 }
 const generated = {
@@ -128,7 +101,7 @@ assertObjectJsonSchema(generated.edit)
 assertObjectJsonSchema(generated.write)
 assertSupportedJsonSchema(generated.output)
 
-/** 键序无关的规范形式：字段顺序不是语义，比较时不该被它绊倒。 */
+/** 键序无关的规范形式。 */
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical)
   if (value !== null && typeof value === 'object') {

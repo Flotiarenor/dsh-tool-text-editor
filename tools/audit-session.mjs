@@ -1,34 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Flotiarenor
 // SPDX-License-Identifier: Apache-2.0
 /**
- * audit-session.mjs —— 以**真实会话日志**核对两个工具进入模型上下文的字节数。
+ * audit-session.mjs —— 用真实会话日志核对两个工具进入模型上下文的字节数。
  *
- * `tools/measure-context.mjs` 测量构造场景，本脚本核对已发生的调用：dsh 把每个工具结果按
- * `tool/result` 事件写入会话日志（`<DSH_HOME>/sessions/<工作区>/session-<id>/session.jsonl.zstd`），
- * 事件中的 `data.message.content` 即**进入模型上下文的那份文本**。因此可以逐调用对账：
+ * `tool/result` 事件的 `data.message.content` 即**进入模型上下文的那份文本**；日志在 `<DSH_HOME>/sessions/`，
+ * 分帧 zstd（Node 只解第一帧，故按魔数切帧）。对账列：入参字节 | 模型可见字节 | 倍率 | 行数。
  *
- *   工具名 | 入参字节 | 模型可见字节 | 倍率 | 行数
+ * 检查三项：**形状**（成功 `WROTE` 加统计/警告行，失败 `FAIL` 加原因；出现 diff 头尾、备份名或临时文件名即
+ * 报告）、**路径回显**（成功结果不得含本次调用的 `file_path`）、**上限**（单条超过 `--cap`，默认 1024 B）。
+ * `--assert` 下有泄漏或超限即退出码 1。
  *
- * 另做两项检查：
- *   * **形状与泄漏** —— 成功必须形如 `WROTE` 加统计/警告行，失败形如 `FAIL` 加原因；
- *     出现 diff 正文、`=== ` 头、`OK ` 尾、备份名或内部临时文件名即报告；
- *   * **不回显路径** —— 成功结果里**不得**出现本次调用参数中的 `file_path`：结果与调用一一绑定，
- *     回显它新信息量为零（实测占成功结果字节的 48%）。失败原因**允许**出现路径（它要指名文件）。
- *   * **超限** —— 单条结果超过 `--cap`（默认 1024 B）即报告，配合 `--assert` 时退出码 1。
+ * `--tools` 只打印每轮真正下发的工具表（`request/header` 的 `data.header.tools[].name`）：表里还有原生
+ * `write` / `edit` 说明门禁（`lib/mask.mjs`）没生效——这是唯一判据，`--assert` 下同样退出码 1。
  *
- * 会话日志为**分帧 zstd**（边运行边追加），Node 的解压 API 只解第一帧，故此处自行按魔数切帧。
- * 零依赖，只用 `node:` 内置模块；不写入任何文件。
- *
- * `--tools` 换一个视角：不数字节，只打印**每一轮真正下发的工具表**（`request/header` 事件里的
- * `data.header.tools[].name`）。这是判断门禁（`lib/mask.mjs`）有没有生效的唯一标准——工具表里还有
- * 原生 `write` / `edit` 就说明没生效，别的都是间接证据。
- *
- * 用法：
- *   node tools/audit-session.mjs                          # 扫 ~/.dsh/sessions 下的全部会话
- *   node tools/audit-session.mjs <session.jsonl.zstd>      # 只看一个会话（给出逐调用明细）
- *   node tools/audit-session.mjs <目录> --top 8            # 每个会话列出最大的 8 条结果
- *   node tools/audit-session.mjs <文件> --cap 512 --assert
- *   node tools/audit-session.mjs --tools                   # 每个会话的 request/header 工具表
+ * 用法：node tools/audit-session.mjs [<文件|目录>] [--top N] [--cap N] [--assert] [--tools]
+ * 给单个文件时另打逐调用明细。退出码 2 = 无会话日志或 `--cap` 非法；零依赖，只用 `node:` 内置模块。
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
@@ -37,22 +23,14 @@ import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
 const WATCHED = ['edit_text', 'write_text']
-/** 门禁要收窄掉的原生名字：它们还在工具表里，就说明门禁没生效。 */
+/** 门禁要收窄掉的原生名字：还在工具表里就说明门禁没生效。 */
 const NATIVE = ['write', 'edit']
-/**
- * 模型可见文本的**允许形状**：成功是 `WROTE` 加可选的一行统计与警告，失败是 `FAIL` 加原因。
- * 除此之外的一切（diff 正文、`=== ` 头、`OK ` 尾、备份名、内部临时文件名）都算泄漏——
- * 被编辑的文件内容不参与匹配，因为渲染结果里本就不该出现它。
- *
- * 关键字后面**不允许**再跟路径：那正是这次要钉住的回归（见文件头"不回显路径"）。
- */
+/** 允许形状（见文件头）；关键字后跟路径的旧版本形状由 `LEGACY_TEXT` 识别。 */
 const ALLOWED_TEXT = /^(WROTE|FAIL)(\n(?!\S*\.tmp\b)[^\n]*)*$/
-/**
- * **历史**形状：关键字后跟路径（本插件早期版本的回显）。它只用来把旧会话与新回归区分开——
- * 旧日志不该让 `--assert` 永远失败，但也不该被当成合格样本（其路径回显正是新形状要消除的东西）。
- */
+/** **历史**形状：只用来把旧会话与新回归分开，不该让 `--assert` 永远失败。 */
 const LEGACY_TEXT = /^(WROTE|FAIL)( [^\n]*)?(\n(?!\S*\.tmp\b)[^\n]*)*$/
-const FORBIDDEN = [/\S*\.tmp\b/, /^=== /m, /^OK /m, /^备份 /m, /^DRY RUN /m]
+/** 当前形状不该出现的痕迹：临时文件名、早期 diff 头尾、备份名、dry-run 行。 */
+const FORBIDDEN = [/\S*\.tmp\b/, /^=== /m, /^@@ /m, /^OK /m, /^备份 /m, /^DRY RUN /m]
 const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
 
 const argv = process.argv.slice(2)
@@ -67,38 +45,55 @@ const ASSERT = hasFlag('--assert')
 const TOOLS = hasFlag('--tools')
 const bytes = (value) => Buffer.byteLength(value ?? '', 'utf8')
 
+// 上限非数字必须报错：`bytes > NaN` 恒为 false，门禁会静默全过。
+if (!Number.isFinite(CAP) || CAP < 0) {
+  console.error(`FAIL --cap 需要一个非负字节数，收到 ${JSON.stringify(flagValue('--cap', ''))}`)
+  process.exit(2)
+}
+
 /**
- * 解出日志的全部 zstd 帧。
- * 会话日志逐帧追加：`zstdDecompressSync` 只解第一帧，其余帧被静默丢弃（症状是日志有数 MB，却只解出
- * 数百字节）。此处按魔数切帧，并以"解不开则并入下一帧"覆盖魔数误判。
+ * `tool-call` 块的参数是 JSON **字符串**，不是对象：字节量字符串本身，读字段要先解析。
+ */
+function callArguments(call) {
+  const text = typeof call?.arguments === 'string' ? call.arguments : ''
+  let parsed = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+  return { text, value: parsed !== null && typeof parsed === 'object' ? parsed : {} }
+}
+
+/**
+ * 解不开的段并入下一帧（段内可能碰巧出现魔数）；**尾部解不开的帧丢弃**——会话追加中读到半个尾帧是常态。
  */
 function decodeFrames(buffer) {
   const offsets = []
   for (let i = 0; i + 3 < buffer.length; i += 1) {
-    if (buffer[i] === ZSTD_MAGIC[0] && buffer[i + 1] === ZSTD_MAGIC[1]
-      && buffer[i + 2] === ZSTD_MAGIC[2] && buffer[i + 3] === ZSTD_MAGIC[3]) offsets.push(i)
+    if (ZSTD_MAGIC.every((byte, index) => buffer[i + index] === byte)) offsets.push(i)
   }
   if (offsets.length === 0) return buffer.toString('utf8')
   const parts = []
   let index = 0
   while (index < offsets.length) {
     let next = index + 1
-    for (;;) {
+    let decoded = false
+    for (; next <= offsets.length && !decoded; next += 1) {
       const slice = buffer.subarray(offsets[index], next < offsets.length ? offsets[next] : buffer.length)
       try {
         parts.push(zstdDecompressSync(slice))
-        break
-      } catch (error) {
-        next += 1
-        if (next > offsets.length) throw error
+        decoded = true
+      } catch {
+        // 解不开就并入下一帧。
       }
     }
-    index = next
+    if (!decoded) break
+    index = next - 1
   }
   return Buffer.concat(parts).toString('utf8')
 }
 
-/** 读取会话日志 → 事件数组。`undefined` 表示这个文件不是会话日志。 */
 function readEvents(file) {
   const raw = readFileSync(file)
   const text = file.endsWith('.zstd') ? decodeFrames(raw) : raw.toString('utf8')
@@ -108,13 +103,12 @@ function readEvents(file) {
     try {
       events.push(JSON.parse(line))
     } catch {
-      // 会话正在写入时最后一行可能被截断：忽略，不当成错误。
+      // 写入中的最后一行可能被截断：忽略。
     }
   }
   return events
 }
 
-/** 一个会话里所有工具调用的对账结果。 */
 function audit(file) {
   const events = readEvents(file)
   const calls = new Map()
@@ -135,16 +129,20 @@ function audit(file) {
     const text = (event.data?.message?.content ?? [])
       .map((block) => (block.type === 'tool-result' ? (block.content ?? []).map((content) => content.text ?? '').join('') : ''))
       .join('')
-    if (WATCHED.includes(name)) {
-      const legacy = !ALLOWED_TEXT.test(text) && LEGACY_TEXT.test(text)
-      if (legacy) {
-        // 新形状之前的会话：只计数，不当泄漏，也不参与下面的路径回显检查。
+    const watched = WATCHED.includes(name)
+    const args = callArguments(call)
+    const argBytes = bytes(args.text)
+    const visibleBytes = bytes(text)
+    if (watched) {
+      const allowed = ALLOWED_TEXT.test(text)
+      if (!allowed && LEGACY_TEXT.test(text)) {
+        // 旧形状只计数，不判泄漏，也不查路径回显。
         legacyShapes += 1
       } else {
         const hit = FORBIDDEN.filter((pattern) => pattern.test(text))
-        if (!ALLOWED_TEXT.test(text)) hit.push(/unexpected shape/)
+        if (!allowed) hit.push(/unexpected shape/)
         // 成功结果不得回显路径（失败原因可以，它要指名文件）。
-        const given = call?.arguments?.file_path
+        const given = args.value.file_path
         if (text.startsWith('WROTE') && typeof given === 'string' && given !== '' && text.includes(given)) {
           hit.push(/echoed file_path/)
         }
@@ -153,20 +151,19 @@ function audit(file) {
     }
     const record = perTool.get(name) ?? { calls: 0, argBytes: 0, visibleBytes: 0, worstBytes: 0, worstLabel: '' }
     record.calls += 1
-    record.argBytes += bytes(JSON.stringify(call?.arguments ?? {}))
-    record.visibleBytes += bytes(text)
-    if (bytes(text) > record.worstBytes) {
-      record.worstBytes = bytes(text)
+    record.argBytes += argBytes
+    record.visibleBytes += visibleBytes
+    if (visibleBytes > record.worstBytes) {
+      record.worstBytes = visibleBytes
       record.worstLabel = text.split('\n')[0].slice(0, 56)
     }
     perTool.set(name, record)
-    if (WATCHED.includes(name)) {
-      const argBytes = bytes(JSON.stringify(call?.arguments ?? {}))
+    if (watched) {
       rows.push({
         name,
         argBytes,
-        visibleBytes: bytes(text),
-        ratio: argBytes === 0 ? 0 : bytes(text) / argBytes,
+        visibleBytes,
+        ratio: argBytes === 0 ? 0 : visibleBytes / argBytes,
         lines: text === '' ? 0 : text.split('\n').length,
         head: text.split('\n')[0].slice(0, 56),
         time: typeof event.time === 'number' ? new Date(event.time).toISOString().slice(11, 19) : '',
@@ -176,14 +173,7 @@ function audit(file) {
   return { perTool, rows, leaks, legacyShapes }
 }
 
-/**
- * 每一轮真正下发的工具表。
- *
- * `request/header` 是宿主把这一轮的工具表写进日志的地方（工具表变了才写一条），
- * `data.header.tools[].name` 就是模型当轮看得见的全部工具名。判断门禁是否生效看它，不看别的。
- * @param file - 会话日志路径。
- * @returns 每条 header 一条记录（顺序即时间顺序）。
- */
+/** 每轮真正下发的工具表（工具表变了宿主才写一条 `request/header`）。 */
 function toolTables(file) {
   const tables = []
   for (const event of readEvents(file)) {
@@ -199,7 +189,6 @@ function toolTables(file) {
   return tables
 }
 
-/** 目标：一个会话文件，或一棵会话目录。 */
 function collect(target) {
   const stat = statSync(target)
   if (stat.isFile()) return [target]
@@ -223,21 +212,16 @@ if (files.length === 0) {
   process.exit(2)
 }
 
-let overCap = 0
-let leaked = 0
-let legacy = 0
-let watchedCalls = 0
-let watchedVisible = 0
-let narrowedSessions = 0
-let openSessions = 0
-
-// ── `--tools`：只打印每轮下发的工具表，不做字节对账 ─────────────────────────────
-
 if (TOOLS) {
+  // ── `--tools`：只打印工具表 ─────────────────────────────────────────────────
+  let narrowedSessions = 0
+  let openSessions = 0
+  let headerlessSessions = 0
   for (const file of files) {
     const tables = toolTables(file)
     console.log(`\n=== ${file}  (${(statSync(file).size / 1024).toFixed(0)} KiB)`)
     if (tables.length === 0) {
+      headerlessSessions += 1
       console.log('  no request/header yet')
       continue
     }
@@ -249,72 +233,83 @@ if (TOOLS) {
         + `   our tools: ${ours.length > 0 ? ours.join(', ') : 'absent'}`)
       if (index === tables.length - 1) console.log(`      ${table.names.join(', ')}`)
     }
-    const last = tables.at(-1)
-    if (NATIVE.every((name) => !last.names.includes(name))) narrowedSessions += 1
+    // 判定只看最后一条 header（模型当前拿到的那张表）。
+    if (NATIVE.every((name) => !tables.at(-1).names.includes(name))) narrowedSessions += 1
     else openSessions += 1
   }
   console.log('')
-  console.log(`scanned ${files.length} session log(s): the last header of ${narrowedSessions} has no native write/edit, ${openSessions} still does`)
+  console.log(`scanned ${files.length} session log(s): the last header of ${narrowedSessions} has no native write/edit, `
+    + `${openSessions} still does, ${headerlessSessions} has no header at all`)
   console.log(openSessions === 0
     ? 'mask check        : every session ends on a narrowed tool table'
     : 'mask check        : sessions whose last header still lists the natives either predate the fix or run a preset without the mask row')
-  process.exit(0)
-}
+  // 不用 `process.exit()`：它会丢掉未刷进管道的日志。`--assert` 把这张表变成门禁。
+  if (ASSERT && openSessions > 0) process.exitCode = 1
+} else {
+  let overCap = 0
+  let leaked = 0
+  let legacy = 0
+  let watchedCalls = 0
+  let watchedVisible = 0
 
-for (const file of files) {
-  const { perTool, rows, leaks, legacyShapes } = audit(file)
-  legacy += legacyShapes
-  const textTools = [...perTool.entries()].filter(([name]) => WATCHED.includes(name))
-  // 有这两个工具的调用就只看它们，否则退化成"这次会话里所有工具"的概览。
-  const shown = textTools.length > 0 ? textTools : [...perTool.entries()]
-  console.log(`\n=== ${file}  (${(statSync(file).size / 1024).toFixed(0)} KiB)`)
-  if (shown.length === 0) {
-    console.log('  no tool results')
-    continue
-  }
-  let calls = 0
-  let argBytes = 0
-  let visibleBytes = 0
-  let worst = 0
-  for (const [name, record] of shown) {
-    calls += record.calls
-    argBytes += record.argBytes
-    visibleBytes += record.visibleBytes
-    worst = Math.max(worst, record.worstBytes)
-    console.log(`  ${name.padEnd(16)} calls=${String(record.calls).padStart(3)}  args=${String(record.argBytes).padStart(8)} B  `
-      + `result=${String(record.visibleBytes).padStart(8)} B  worst=${String(record.worstBytes).padStart(6)} B  ${record.worstLabel}`)
-  }
-  console.log(`  ${'TOTAL'.padEnd(16)} calls=${calls}  args=${argBytes} B  result=${visibleBytes} B  worst=${worst} B`)
-
-  for (const row of rows) watchedCalls += 1
-  for (const row of rows) watchedVisible += row.visibleBytes
-
-  const biggest = [...rows].sort((a, b) => b.visibleBytes - a.visibleBytes).slice(0, Number.isFinite(TOP) ? TOP : 3)
-  if (biggest.length > 0) {
-    console.log(`  --- largest model-visible results (top ${biggest.length})`)
-    for (const row of biggest) {
-      console.log(`  ${row.time}  ${row.name.padEnd(10)} args=${String(row.argBytes).padStart(7)} B  visible=${String(row.visibleBytes).padStart(7)} B  `
-        + `ratio=${row.ratio.toFixed(2)}x  lines=${row.lines}  ${row.head}`)
+  for (const file of files) {
+    const { perTool, rows, leaks, legacyShapes } = audit(file)
+    legacy += legacyShapes
+    const allTools = [...perTool.entries()]
+    const textTools = allTools.filter(([name]) => WATCHED.includes(name))
+    // 有这两个工具的调用就只看它们，否则概览全部工具。
+    const shown = textTools.length > 0 ? textTools : allTools
+    console.log(`\n=== ${file}  (${(statSync(file).size / 1024).toFixed(0)} KiB)`)
+    if (shown.length === 0) {
+      console.log('  no tool results')
+      continue
     }
-  }
-  if (files.length === 1) {
-    console.log('  --- every call')
+    let calls = 0
+    let argBytes = 0
+    let visibleBytes = 0
+    let worst = 0
+    for (const [name, record] of shown) {
+      calls += record.calls
+      argBytes += record.argBytes
+      visibleBytes += record.visibleBytes
+      worst = Math.max(worst, record.worstBytes)
+      console.log(`  ${name.padEnd(16)} calls=${String(record.calls).padStart(3)}  args=${String(record.argBytes).padStart(8)} B  `
+        + `result=${String(record.visibleBytes).padStart(8)} B  worst=${String(record.worstBytes).padStart(6)} B  ${record.worstLabel}`)
+    }
+    console.log(`  ${'TOTAL'.padEnd(16)} calls=${calls}  args=${argBytes} B  result=${visibleBytes} B  worst=${worst} B`)
+
     for (const row of rows) {
-      console.log(`  ${row.time}  ${row.name.padEnd(10)} args=${String(row.argBytes).padStart(7)} B  visible=${String(row.visibleBytes).padStart(7)} B  `
-        + `ratio=${row.ratio.toFixed(2)}x  lines=${String(row.lines).padStart(4)}  ${row.head}`)
+      watchedCalls += 1
+      watchedVisible += row.visibleBytes
     }
-  }
-  const over = rows.filter((row) => row.visibleBytes > CAP)
-  overCap += over.length
-  for (const row of over) console.log(`  OVER CAP  ${row.visibleBytes} B > ${CAP} B  ${row.name}  ${row.head}`)
-  leaked += leaks.length
-  if (leaks.length > 0) console.log(`  LEAK  ${leaks.length} result(s) with unexpected text: ${[...new Set(leaks)].slice(0, 3).join(' | ')}`)
-  if (legacyShapes > 0) console.log(`  LEGACY  ${legacyShapes} result(s) in the older shape (WROTE/FAIL followed by a path); pre-change sessions only`)
-}
 
-console.log('')
-console.log(`scanned ${files.length} session log(s): ${watchedCalls} text-editor calls, ${watchedVisible} B of model-visible text total`)
-console.log(leaked === 0 ? 'text check        : every result matches the documented shape' : `text check        : ${leaked} result(s) with unexpected text`)
-console.log(legacy === 0 ? 'legacy check      : no pre-change results found' : `legacy check      : ${legacy} result(s) from before the path echo was dropped (informational)`)
-console.log(overCap === 0 ? `cap check         : every result <= ${CAP} B` : `cap check         : ${overCap} result(s) over ${CAP} B`)
-if (ASSERT && (leaked > 0 || overCap > 0)) process.exitCode = 1
+    const biggest = rows.toSorted((a, b) => b.visibleBytes - a.visibleBytes).slice(0, Number.isFinite(TOP) ? TOP : 3)
+    if (biggest.length > 0) {
+      console.log(`  --- largest model-visible results (top ${biggest.length})`)
+      for (const row of biggest) {
+        console.log(`  ${row.time}  ${row.name.padEnd(10)} args=${String(row.argBytes).padStart(7)} B  visible=${String(row.visibleBytes).padStart(7)} B  `
+          + `ratio=${row.ratio.toFixed(2)}x  lines=${row.lines}  ${row.head}`)
+      }
+    }
+    if (files.length === 1) {
+      console.log('  --- every call')
+      for (const row of rows) {
+        console.log(`  ${row.time}  ${row.name.padEnd(10)} args=${String(row.argBytes).padStart(7)} B  visible=${String(row.visibleBytes).padStart(7)} B  `
+          + `ratio=${row.ratio.toFixed(2)}x  lines=${String(row.lines).padStart(4)}  ${row.head}`)
+      }
+    }
+    const over = rows.filter((row) => row.visibleBytes > CAP)
+    overCap += over.length
+    for (const row of over) console.log(`  OVER CAP  ${row.visibleBytes} B > ${CAP} B  ${row.name}  ${row.head}`)
+    leaked += leaks.length
+    if (leaks.length > 0) console.log(`  LEAK  ${leaks.length} result(s) with unexpected text: ${[...new Set(leaks)].slice(0, 3).join(' | ')}`)
+    if (legacyShapes > 0) console.log(`  LEGACY  ${legacyShapes} result(s) in the older shape (WROTE/FAIL followed by a path); pre-change sessions only`)
+  }
+
+  console.log('')
+  console.log(`scanned ${files.length} session log(s): ${watchedCalls} text-editor calls, ${watchedVisible} B of model-visible text total`)
+  console.log(leaked === 0 ? 'text check        : every result matches the documented shape' : `text check        : ${leaked} result(s) with unexpected text`)
+  console.log(legacy === 0 ? 'legacy check      : no pre-change results found' : `legacy check      : ${legacy} result(s) from before the path echo was dropped (informational)`)
+  console.log(overCap === 0 ? `cap check         : every result <= ${CAP} B` : `cap check         : ${overCap} result(s) over ${CAP} B`)
+  if (ASSERT && (leaked > 0 || overCap > 0)) process.exitCode = 1
+}

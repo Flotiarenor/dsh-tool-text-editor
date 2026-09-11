@@ -1,26 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Flotiarenor
 // SPDX-License-Identifier: Apache-2.0
 /**
- * repro-mask.mjs —— 用**真实的** `dsh-agent-presets` 驱动门禁（`lib/mask.mjs`），验证两条组合路径。
+ * repro-mask.mjs —— 用真实 `dsh-agent-presets` 驱动门禁（`lib/mask.mjs`），验证组合时序。
  *
- * 为什么不能只靠 `probe-mask.mjs`：那个探针手工把 `agent/created` 递给监听器，验的是"监听器被调用之后
- * 注册表语义对不对"，从来没有验过**这个事件会不会被投递**。GUI 真实流程不是"preset 挂好之后再建 agent"，
- * 而是"先按默认 preset 建 agent，再把用户选的 preset 重新挂上去"（`AgentPresets.recompose()`）——
- * 重挂是父级 re-link，不是重建 agent，`agent/created` 早就在错误的组合下发完了。所以这里：
+ * 与 `probe-mask.mjs` 的分工：那个探针自己搭常驻作用域，够不到 `recompose()` 的父级 re-link。GUI 的真实
+ * 流程是"先按默认 preset 建 agent，再换成用户选的 preset"；re-link 不是重建 agent，`agent/created` 早就在
+ * 旧组合下发完了——只认建档事件的实现整整一轮没生效。
  *
- *   * 真栈：真 `Loader` + 真 `AgentPresets` + 真 `AgentRegistry`（`ctx.agents`），preset 是临时目录里
- *     真实的 `agent.cordis.yml`，行是真实的模块文件（本仓库的 `lib/mask.mjs` 按绝对路径入列）；
- *   * 两条路径都断言"收窄后的工具表"，而不是断言事件有没有到；
- *   * 顺带断言"未加入本 preset 的兄弟 agent 照旧看得见原生工具"（门禁是组合事实，不是全局开关）。
+ * 真栈，不 mock：真 `Loader` / `AgentPresets` / `AgentRegistry`，preset 与行都是临时目录里的真文件
+ * （`lib/mask.mjs` 按绝对路径入列）；各条路径断言收窄后的工具表而不是事件投递。
  *
- * 需要一份装有 `@deepseek-ai/cordis` / `dsh-tools` / `dsh-scope` / `dsh-system-prompt` / `dsh-agent` /
- * `dsh-agent-presets` / `dsh-session-projection` / `cordis-plugin-loader` 的 dsh：入口按常见布局去找
- * （`DSH_PACKAGES_ROOT` 可显式指定）。找不到时退出码 2（"这次没跑成"）。
- *
- * 用法：
- *   node tools/repro-mask.mjs
- *   $env:DSH_PACKAGES_ROOT = '<dsh profile>/node_modules/@deepseek-ai'; node tools/repro-mask.mjs
- * 退出码：0 全过，1 有失败，2 找不到 dsh 包。
+ * 需要装有 `@deepseek-ai/cordis` / `dsh-tools` / `dsh-scope` / `dsh-system-prompt` / `dsh-agent` /
+ * `dsh-agent-presets` / `dsh-session-projection` / `cordis-plugin-loader` 的 dsh：入口按常见布局枚举，
+ * `DSH_PACKAGES_ROOT` 可显式指定。用法 `node tools/repro-mask.mjs`；退出码 0 全过 / 1 有失败 / 2 找不到包。
  */
 
 import { existsSync, rmSync } from 'node:fs'
@@ -30,14 +22,14 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)))
-/** 本次跑出来的临时 preset 根目录：正常路径由 `dispose()` 删，任何一步抛出时由退出钩子兜底。 */
+/** 临时 preset 根目录：正常路径由 `dispose()` 删，抛错时由退出钩子兜底。 */
 const temporary = new Set()
 process.on('exit', () => {
   for (const dir of temporary) {
     try {
       rmSync(dir, { recursive: true, force: true })
     } catch {
-      // 退出阶段的清理失败不该掩盖真正的失败原因。
+      // 清理失败不该掩盖真正的失败原因。
     }
   }
 })
@@ -53,10 +45,7 @@ const PACKAGES = [
   'dsh-tools',
 ]
 
-/**
- * 找一份 dsh 的 `@deepseek-ai` 包目录（与 `tools/probe-mask.mjs` 同一套布局枚举）。
- * @returns 含全部所需包的目录，或 `undefined`。
- */
+/** 找一份 dsh 的 `@deepseek-ai` 包目录（枚举同 `probe-mask.mjs`）。 */
 function findPackages() {
   const candidates = []
   const add = (root, nested) => {
@@ -81,10 +70,10 @@ if (root === undefined) {
   process.exit(2)
 }
 
-const entry = (pkg, file = 'lib/index.js') => pathToFileURL(join(root, pkg, file)).href
+const entry = (pkg) => pathToFileURL(join(root, pkg, 'lib', 'index.js')).href
 const { Context } = await import(entry('cordis'))
 const { Loader } = await import(entry('cordis-plugin-loader'))
-const { SystemPrompt } = await import(entry('dsh-system-prompt'))
+const { SystemPrompt, renderPrompt } = await import(entry('dsh-system-prompt'))
 const { ToolRuntime } = await import(entry('dsh-tools'))
 const { SessionProjectionRegistry } = await import(entry('dsh-session-projection'))
 const { AgentRegistry } = await import(entry('dsh-agent'))
@@ -103,11 +92,17 @@ function check(label, condition, detail = '') {
   console.log(`FAIL  ${label}${detail === '' ? '' : ' — ' + detail}`)
 }
 
-/**
- * 合成"原生 tool-fs"行：注册 `read` / `write` / `edit`，并按 0.1.5-rc.2 的形状把引导段写成
- * **按可见性求值**的函数（`dsh-tool-fs` 就是这么写的）——这样"引导是否还在"就是可见性的函数，
- * 不需要门禁去注册空段遮蔽。
- */
+/** 把 `warn` 收进 `sink`，供断言检查。 */
+function captureWarnings(ctx, sink) {
+  const warn = ctx.logger?.warn?.bind(ctx.logger)
+  if (warn === undefined) return
+  ctx.logger.warn = (...args) => {
+    sink.push(args.join(' '))
+    warn(...args)
+  }
+}
+
+/** 合成"原生 tool-fs"行：`read` / `write` / `edit` + 按 `dsh-tool-fs` 形状写成按可见性求值的引导段。 */
 const NATIVE_ROW = `export const inject = ['tools', 'systemPrompt']
 const tool = (name) => ({
   name,
@@ -135,11 +130,7 @@ export function apply(ctx) {
 }
 `
 
-/**
- * 搭一套"宿主平面 + 两个 preset"的真栈。
- * @param options - `maskRow` 为门禁行的行配置（`undefined` 表示不加这一行）。
- * @returns 驱动用的句柄集合。
- */
+/** 搭一套"宿主平面 + 两个 preset"的真栈；`maskRow` 是门禁行的行配置，`undefined` 表示不加这一行。 */
 async function harness(maskRow) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-mask-repro-'))
   temporary.add(dir)
@@ -156,7 +147,7 @@ async function harness(maskRow) {
     await mkdir(join(presetsRoot, id), { recursive: true })
     await writeFile(join(presetsRoot, id, 'native-tools.mjs'), NATIVE_ROW)
   }
-  // `masked` 就是真实组合的形状：原生工具行 + 本插件的编辑行 + 门禁行（按绝对路径入列，跑的是仓库里的真文件）。
+  // `masked` 是真实组合的形状：原生工具行 + 编辑行 + 门禁行（后两行按绝对路径，跑真文件）。
   const editorRow = `- name: ${join(REPO, 'lib', 'editor.mjs')}\n`
   await writeFile(join(presetsRoot, 'plain', 'agent.cordis.yml'), '- name: ./native-tools.mjs\n')
   await writeFile(join(presetsRoot, 'native', 'agent.cordis.yml'), '- name: ./native-tools.mjs\n')
@@ -166,7 +157,8 @@ async function harness(maskRow) {
   )
 
   const ctx = new Context()
-  ctx.baseUrl = pathToFileURL(join(dir, 'harness') + '\\').href
+  // `AgentPresets` 要求 `ctx.baseUrl`（解析组合里的包名行用）；这里指向一个不存在的 harness 目录。
+  ctx.baseUrl = pathToFileURL(join(dir, 'harness') + '/').href
   const warnings = []
   await ctx.plugin(Loader, {})
   await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
@@ -185,19 +177,12 @@ async function harness(maskRow) {
     inject: ['tools', 'systemPrompt'],
     apply(c) {
       host = c
-      const original = c.logger?.warn?.bind(c.logger)
-      if (original !== undefined) c.logger.warn = (...args) => { warnings.push(args.join(' ')); original(...args) }
+      captureWarnings(c, warnings)
     },
   })
 
-  /**
-   * 造一个 agent 并把它登记进真注册表（`announce()` 会发 `agent/created`，作用域按 agent 作用域过滤）。
-   * 作用域上下文从声明了 `tools` / `systemPrompt` 的上下文里铸出来——真实系统里这一步由 agent 工厂做，
-   * 少了它会得到 "cannot get property tools without inject"。
-   * @param id - agent 与 session 共用的 id。
-   * @param preset - 建档时加入的 preset，`undefined` 表示先不加入任何 preset（GUI 里"先建后换"的形态）。
-   * @returns 已登记的 agent。
-   */
+  /** 造一个 agent 并登记进真注册表（`agent/created` 按 agent 作用域过滤后派发）。作用域必须从声明了
+   * `tools` / `systemPrompt` 的上下文铸出，否则报 "cannot get property tools without inject"。 */
   const spawn = async (id, preset) => {
     const agent = { id, session: { id } }
     agent.ctx = createScope(host, agent).ctx
@@ -206,13 +191,7 @@ async function harness(maskRow) {
     return agent
   }
 
-  /**
-   * 造一个**子 agent**：它不挂载 preset，而是加入父 agent 已经在跑的那个常驻组合（`composeFrom()`，
-   * 与 `dsh-tool-subagent` 的 spawn/fork 同一条路）。
-   * @param id - 子 agent 与 session 共用的 id。
-   * @param parent - 父 agent（必须已经加入某个 preset）。
-   * @returns 已登记的子 agent。
-   */
+  /** 造一个子 agent：不挂载 preset，只加入父 agent 跑的常驻组合（同 `dsh-tool-subagent`）。 */
   const spawnChild = (id, parent) => {
     const agent = { id, session: { id } }
     agent.ctx = createScope(host, agent).ctx
@@ -228,10 +207,7 @@ async function harness(maskRow) {
     spawnChild,
     names: (agent) => ctx.tools.schemas(agent).map((schema) => schema.name).sort().join(','),
     visible: (agent, name) => ctx.tools.get(name, agent) !== undefined,
-    text: async (agent) => {
-      const { renderPrompt } = await import(entry('dsh-system-prompt'))
-      return renderPrompt(await ctx.systemPrompt.assemble({ scope: agent }))
-    },
+    text: async (agent) => renderPrompt(await ctx.systemPrompt.assemble({ scope: agent })),
     call: async (agent, name) => ctx.tools.execute({
       callId: `repro-${agent.id}-${name}`,
       name,
@@ -246,16 +222,16 @@ async function harness(maskRow) {
   }
 }
 
-const NATIVES = 'edit,read,write'
 const MASKED = 'edit_text,read,write_text'
 
-// ── 路径一：建档时就加入门禁 preset（这条今天就是通的） ──────────────────────────
+// ── 路径一：建档时加入 ──
 
 {
   const h = await harness({ mode: 'deny' })
   const agent = await h.spawn('agent:create', 'masked')
   check('create: the agent joined the masked preset', (await h.ctx.agentPresets.composedPreset(agent.ctx)) === 'masked')
-  check('create: the native tools are gone from the catalog', h.names(agent) === MASKED, h.names(agent))
+  const createNames = h.names(agent)
+  check('create: the native tools are gone from the catalog', createNames === MASKED, createNames)
   const refusal = await h.call(agent, 'edit')
   check(
     'create: calling the native by name does not run it',
@@ -265,25 +241,23 @@ const MASKED = 'edit_text,read,write_text'
   await h.dispose()
 }
 
-// ── 路径二：先建后换（`recompose()`）—— 这正是 GUI 走的路，也是本工具的立身之本 ────────
+// ── 路径二：先建后换 ──
 
 {
   const h = await harness({ mode: 'deny' })
   const agent = await h.spawn('agent:swap', 'plain')
-  check('swap: before the switch the agent sees the natives', h.names(agent) === 'edit,read,write', h.names(agent))
   const watched = h.names(agent)
+  check('swap: before the switch the agent sees the natives', watched === 'edit,read,write', watched)
 
   await h.ctx.agentPresets.recompose(agent.ctx, 'masked')
 
-  check(
-    'swap: the switch really recomposed the agent',
-    (await h.ctx.agentPresets.composedPreset(agent.ctx)) === 'masked',
-    String(await h.ctx.agentPresets.composedPreset(agent.ctx)),
-  )
+  const composed = await h.ctx.agentPresets.composedPreset(agent.ctx)
+  check('swap: the switch really recomposed the agent', composed === 'masked', String(composed))
+  const swapped = h.names(agent)
   check(
     'swap: the native tools are gone from the catalog after the switch',
-    h.names(agent) === MASKED,
-    `${watched} -> ${h.names(agent)}`,
+    swapped === MASKED,
+    `${watched} -> ${swapped}`,
   )
   check('swap: the native tool is not visible to the agent', h.visible(agent, 'edit') === false)
   const refusal = await h.call(agent, 'edit')
@@ -302,78 +276,85 @@ const MASKED = 'edit_text,read,write_text'
   await h.dispose()
 }
 
-// ── 路径三：建档时**没有** preset，第一次换才绑定（重挂而不是 rebind） ──────────────
+// ── 路径三：首次绑定 ──
 
 {
   const h = await harness({ mode: 'deny' })
   const agent = await h.spawn('agent:fresh', undefined)
-  check('fresh: an agent with no preset sees only the global layer', h.names(agent) === '', h.names(agent))
+  const bare = h.names(agent)
+  check('fresh: an agent with no preset sees only the global layer', bare === '', bare)
   await h.ctx.agentPresets.recompose(agent.ctx, 'masked')
-  check('fresh: the first switch narrows the catalog too', h.names(agent) === MASKED, h.names(agent))
+  const fresh = h.names(agent)
+  check('fresh: the first switch narrows the catalog too', fresh === MASKED, fresh)
   const refusal = await h.call(agent, 'edit')
   check('fresh: the native does not run', refusal.isError === true, JSON.stringify(refusal).slice(0, 160))
   await h.dispose()
 }
 
-// ── 路径四：反方向换出去——门禁必须把自己注册的东西撤掉 ─────────────────────────
+// ── 路径四：换出去 ──
 
 {
   const h = await harness({ mode: 'deny' })
   const agent = await h.spawn('agent:leave', 'masked')
-  check('leave: the agent starts narrow', h.names(agent) === MASKED, h.names(agent))
+  const narrow = h.names(agent)
+  check('leave: the agent starts narrow', narrow === MASKED, narrow)
   await h.ctx.agentPresets.recompose(agent.ctx, 'native')
-  // 收窄注册在 **agent 自己的层**上，不随 preset 更换自动消失。不撤销的话，这个 agent 在原生组合里
-  // 既看不见原生名字、也看不见本插件的名字——等于一个写工具都没有。
+  // 收窄注册在 agent 自己的层上，不随 preset 更换消失；不撤销的话它在原生组合里既没有原生名字、也没有
+  // 本插件的名字，一个写工具都不剩。
+  const left = h.names(agent)
   check(
     'leave: switching back to a native preset brings the natives back',
-    h.names(agent) === 'edit,read,write',
-    h.names(agent),
+    left === 'edit,read,write',
+    left,
   )
   const ran = await h.call(agent, 'edit')
   check('leave: and the native runs again', ran.isError !== true, JSON.stringify(ran).slice(0, 160))
   await h.dispose()
 }
 
-// ── 路径五：子 agent（`composeFrom()` 加入父组合，不自己 mount） ────────────────
+// ── 路径五：子 agent ──
 
 {
   const h = await harness({ mode: 'deny' })
   const parent = await h.spawn('agent:parent', 'masked')
   const child = h.spawnChild('agent:child', parent)
   check('child: the child joined the same composition', (await h.ctx.agentPresets.composedPreset(child.ctx)) === 'masked')
-  check('child: the child is masked like its parent', h.names(child) === MASKED, h.names(child))
+  const childNames = h.names(child)
+  check('child: the child is masked like its parent', childNames === MASKED, childNames)
   const refusal = await h.call(child, 'write')
   check('child: the native does not run for the child either', refusal.isError === true, JSON.stringify(refusal).slice(0, 160))
   await h.dispose()
 }
 
-// ── 路径六：宿主里还有**别人的守卫**时，归属判据不能被蒙对 ───────────────────────
+// ── 路径六：别人的守卫 ──
 
 {
-  // `dsh-subagent-in-process-driver` 就是这样的宿主插件：它给子 agent 自己的层挂一个守卫，
-  // 对**任何** exec 都回一句理由（它只看自己的结构化输出状态，完全不看 `exec.name`）。
-  // 本行的归属探测必须只认自己的哨兵——`guardReason()` 先走全局层，再按 `chainLayers()` 从最远的
-  // 祖先层开始走，本行挂在常驻层上，因此先被问到、先答哨兵。
+  // `dsh-subagent-in-process-driver` 就这样：守卫挂在子 agent 自己的层上，对任何 exec 都回一句理由（只看
+  // 自己的结构化输出状态，不看 `exec.name`）。探测因此只认自己的哨兵：`guardReason()` 先走全局层，再按
+  // `chainLayers()` 从最远的祖先层走起，本行在常驻层上先被问到。
   const h = await harness({ mode: 'deny' })
   const agent = await h.spawn('agent:foreign-guard', 'plain')
   agent.ctx.tools.guard(() => 'foreign guard: no tool may run')
   await h.ctx.agentPresets.recompose(agent.ctx, 'masked')
+  const foreign = h.names(agent)
   check(
     'foreign guard: a foreign guard answering every call does not confuse the membership probe',
-    h.names(agent) === MASKED,
-    h.names(agent),
+    foreign === MASKED,
+    foreign,
   )
   await h.dispose()
 }
 
-// ── 对照组：另一个 preset 的 agent 不受影响（门禁是组合事实，不是全局开关） ──────────
+// ── 对照组：另一个 preset ──
 
 {
   const h = await harness({ mode: 'deny' })
   const ours = await h.spawn('agent:ours', 'masked')
   const control = await h.spawn('agent:control', 'native')
-  check('control: the masked preset narrows its own agent', h.names(ours) === MASKED, h.names(ours))
-  check('control: a sibling preset keeps the natives', h.names(control) === 'edit,read,write', h.names(control))
+  const oursNames = h.names(ours)
+  check('control: the masked preset narrows its own agent', oursNames === MASKED, oursNames)
+  const controlNames = h.names(control)
+  check('control: a sibling preset keeps the natives', controlNames === 'edit,read,write', controlNames)
   const ran = await h.call(control, 'edit')
   check('control: the sibling can still run the native', ran.isError !== true, JSON.stringify(ran).slice(0, 160))
   await h.dispose()
