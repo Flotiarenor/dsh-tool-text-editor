@@ -290,6 +290,22 @@ console.log('── publishing hygiene ──')
   check('both READMEs name this package', stale.length === 0, `未提及 ${pkg.name}：${JSON.stringify(stale)}`)
 }
 {
+  // 本仓库自己规定 `* text=auto eol=lf`（见 .gitattributes），所以源码与文档必须 LF 且无 BOM。
+  // 这条同样被真实踩过：编辑器把 README.zh.md 存成了 CRLF —— 在一个专治行尾的仓库里尤其难看。
+  const offenders = []
+  for (const rel of PUBLIC) {
+    const bytes = readFileSync(join(REPO, rel))
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) offenders.push(`${rel}: 带 BOM`)
+    for (let i = 1; i < bytes.length; i += 1) {
+      if (bytes[i] === 0x0a && bytes[i - 1] === 0x0d) {
+        offenders.push(`${rel}: CRLF`)
+        break
+      }
+    }
+  }
+  check('every tracked file is LF without BOM, as .gitattributes requires', offenders.length === 0, offenders.join('\n      '))
+}
+{
   // 中英混排：汉字与 `code` / 半角字符之间要有空格，否则渲染成 "UTF-8BOM"、"从read" 这种粘连。
   // 这条规则被真实回退过多次（编辑器保存时吃掉空格），所以固化成断言而不是靠人眼。
   const CJK = '[\\u4e00-\\u9fff]'
