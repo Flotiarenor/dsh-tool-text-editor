@@ -10,3 +10,4 @@ desktop.ini
 
 # dsh 自测留下的临时工作区（正常情况下会在临时目录里，这里是兜底）
 .dsh/
+.tmp-live

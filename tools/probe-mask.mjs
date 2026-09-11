@@ -101,7 +101,7 @@ const tool = (name) => ({
  * @param mode - 门禁模式（`deny` / `guard`）。
  * @returns 上下文、注册表、作用域键与"已创建的 agent"。
  */
-async function harness(mode) {
+async function harness(mode, settings = {}) {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
   await ctx.plugin(ToolRuntime)
@@ -125,7 +125,8 @@ async function harness(mode) {
 
   // 门禁行注册在常驻作用域上；它的监听器由 agent/created 驱动。
   const listeners = []
-  applyMask({ on: (event, listener) => listeners.push([event, listener]), logger: { warn: () => {} } }, { mode })
+  const warnings = []
+  applyMask({ on: (event, listener) => listeners.push([event, listener]), logger: { warn: (message) => warnings.push(String(message)) } }, { mode, ...settings })
 
   /** 一个加入本 preset 的 agent：作用域键就是 agent 本身（与 dsh 一致），并带上自己的作用域上下文。 */
   const join = (id) => {
@@ -138,7 +139,7 @@ async function harness(mode) {
     if (event === 'agent/created') listener({ agent })
   })
 
-  return { ctx, host, standingKey, join, created }
+  return { ctx, host, standingKey, join, created, warnings }
 }
 
 const names = (ctx, scope) => ctx.tools.schemas(scope).map((schema) => schema.name).sort().join(',')
@@ -201,6 +202,65 @@ const call = (agent, name, callId) => ({
   )
   const ok = await ctx.tools.execute(call(watched, 'edit_text', 'guard-ours'))
   check('guard: our own tool is unaffected', ok.isError !== true, JSON.stringify(ok).slice(0, 120))
+}
+
+// ── escape：看不见原生名，但能用 native_* 调到同一个执行体 ─────────────────────
+
+{
+  const { ctx, host, standingKey, join, created, warnings } = await harness('deny', { escape: true })
+  const masked = join('agent:escape')
+  created(masked)
+  if (warnings.length > 0) console.log(`      mask warnings: ${JSON.stringify(warnings)}`)
+
+  check('escape: the native names are gone from the catalog', names(ctx, masked) === 'edit_text,native_edit,native_write,read,write_text', names(ctx, masked))
+  const direct = await ctx.tools.execute(call(masked, 'edit', 'esc-direct'))
+  check('escape: the direct native name is still UNKNOWN_TOOL', direct.error?.info?.code === 'UNKNOWN_TOOL', JSON.stringify(direct).slice(0, 140))
+  const viaEscape = await ctx.tools.execute(call(masked, 'native_edit', 'esc-via'))
+  check('escape: the escape name runs the native body', viaEscape.isError !== true && /edit ran/.test(JSON.stringify(viaEscape)), JSON.stringify(viaEscape).slice(0, 140))
+  check(
+    'escape: the escape parameters are the native ones',
+    JSON.stringify(ctx.tools.get('native_edit', masked).parameters) === JSON.stringify(ctx.tools.get('edit', standingKey).parameters),
+  )
+  check('escape: an unmasked sibling keeps the plain native names', names(ctx, join('agent:escape-control')) === 'edit,edit_text,read,write,write_text')
+}
+
+// ── scope: 'global'：工具在**全局层**，门禁从宿主上下文挂 ───────────────────────
+
+{
+  // 全局形状：原生工具由宿主平面提供（等价于 profile 层的 tool-fs 行），没有任何 preset 参与。
+  // 这才是 `scope: 'global'` 要覆盖的场景——preset 里的 agent 与没有 preset 的 agent 都看得见它们。
+  const ctx = new Context()
+  await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
+  await ctx.plugin(ToolRuntime)
+  let host
+  await ctx.plugin({
+    name: 'fake-global-tool-fs',
+    inject: ['tools', 'systemPrompt'],
+    apply(c) {
+      host = c
+      for (const name of ['read', 'write', 'edit']) c.tools.register(tool(name))
+      for (const name of ['edit_text', 'write_text']) c.tools.register(tool(name))
+    },
+  })
+  const globalWarnings = []
+  const globalListeners = []
+  applyMask(
+    { on: (event, listener) => globalListeners.push([event, listener]), logger: { warn: (message) => globalWarnings.push(String(message)) } },
+    { mode: 'guard', scope: 'global' },
+  )
+  const plain = { id: 'agent:plain', kind: 'agent', ctx: host }
+  // 全局守卫在第一个 agent 创建时注册（那一刻才拿得到真实的服务对象），所以要驱动一次事件。
+  globalListeners.forEach(([event, listener]) => { if (event === 'agent/created') listener({ agent: plain }) })
+  if (globalWarnings.length > 0) console.log(`      mask warnings: ${JSON.stringify(globalWarnings)}`)
+  check('global: every agent still sees the natives (guard keeps them visible)', names(ctx, plain) === 'edit,edit_text,read,write,write_text', names(ctx, plain))
+  const denied = await ctx.tools.execute(call(plain, 'edit', 'global-edit'))
+  check(
+    'global: the call is refused with the reason pointing at our tools',
+    denied.isError === true && /edit_text/.test(JSON.stringify(denied)),
+    JSON.stringify(denied).slice(0, 140),
+  )
+  const ours = await ctx.tools.execute(call(plain, 'edit_text', 'global-ours'))
+  check('global: our own tools are untouched', ours.isError !== true, JSON.stringify(ours).slice(0, 120))
 }
 
 console.log('')
