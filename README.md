@@ -102,15 +102,20 @@ Both tools return the same canonical value (`OUTPUT_SCHEMA`). Field contents and
 | `path` | the target path as supplied by the caller, echoed back | — |
 | `ok` / `wrote` / `dryRun` | outcome flags | — |
 | `brief` | warning lines plus one stat line, e.g. `replace@60 +1/-1` | model context |
-| `diff` | a unified diff of the changed lines only (0 context lines), limited by `maxDiffLines` | model context |
+| `diff` | a unified diff of the changed lines only (`@@` hunk headers, 0 context lines, no `---` / `+++` file headers), limited by `maxDiffLines` | model context |
 | `stdout` | the full human record: path header, complete diff with context lines, backup filename | UI / logs / triage |
 | `stderr` | failure reason (non-empty on failure) | model context |
 
 The model-facing text consists of `brief` and `diff`, with the path appearing once in the leading
-line. The complete diff is additionally projected by `output.presentationMeta` into a list of
+line; the `diff` body carries no `---` / `+++` file headers, so the path never recurs inside it. The
+complete diff is additionally projected by `output.presentationMeta` into a list of
 `{ path, oldText, newText }`, the same card vocabulary the built-in `edit` / `write` tools use, and
 handed to the Web UI by `presentResult`; that metadata is persisted with `tool/result` and never
 enters the model context.
+
+On failure neither `brief` nor `diff` is returned: the model-facing text is `FAIL` plus the target
+path, followed by the complete failure reason. That reason is produced by the core and usually
+contains the workspace-relative path once more (a failure favours a complete reason).
 
 The `diff` argument selects the detail level of the `diff` field:
 

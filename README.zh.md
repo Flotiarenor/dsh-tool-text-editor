@@ -103,13 +103,17 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | `path`              | 调用方给出的目标路径（原样回填）                                         | —                |
 | `ok` / `wrote` / `dryRun` | 执行结果标志                                                       | —                |
 | `brief`             | 警告行与一行统计，如 `replace@60 +1/-1`                              | 模型上下文       |
-| `diff`              | 只由改动行组成的 unified diff（0 上下文行），受 `maxDiffLines` 限制 | 模型上下文       |
+| `diff`              | 只含 `@@` 块头与改动行的 unified diff（0 上下文行、无 `---` / `+++` 文件头），受 `maxDiffLines` 限制 | 模型上下文       |
 | `stdout`            | 人读全文：路径头、含上下文行的完整 diff、备份文件名                      | UI / 日志 / 排查 |
 | `stderr`            | 失败原因（失败时非空）                                                   | 模型上下文       |
 
-模型可见文本由 `brief` 与 `diff` 组成，路径在起始行出现一次。完整 diff 另经
-`output.presentationMeta` 投影为 `{ path, oldText, newText }` 列表，与原生 `edit` / `write` 的卡片
-词汇同形，由 `presentResult` 交给 Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
+模型可见文本由 `brief` 与 `diff` 组成，路径在起始行出现一次；`diff` 正文不含 `---` / `+++` 文件头，
+因此路径不会在正文中再次出现。完整 diff 另经 `output.presentationMeta` 投影为
+`{ path, oldText, newText }` 列表，与原生 `edit` / `write` 的卡片词汇同形，由 `presentResult` 交给
+Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
+
+失败时不返回 `brief` 与 `diff`：模型可见文本为 `FAIL` 加目标路径，其后是完整的失败原因；原因文本由
+核心生成，其中通常再包含一次工作区相对路径（失败路径优先保证原因完整）。
 
 `diff` 参数决定 `diff` 字段的详细程度：
 

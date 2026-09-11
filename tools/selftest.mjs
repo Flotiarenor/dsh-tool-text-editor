@@ -406,6 +406,9 @@ async function resultTextSuite() {
   check('result: a small edit still shows the changed lines', smallText.includes('-beta') && smallText.includes('+BETA'), smallText)
   check('result: the model-facing diff carries no context lines', !smallText.includes(' alpha'), smallText)
   check('result: the rendered text no longer carries the backup name', !smallText.includes('备份'), smallText)
+  check('result: the path still appears exactly once when a body is present', smallText.split('small.txt').length - 1 === 1, smallText)
+  check('result: the model-facing body carries no file headers', !smallText.includes('--- ') && !smallText.includes('+++ '), smallText)
+  check('result: the standard headers are still in stdout', small.stdout.includes('--- a/small.txt') && small.stdout.includes('+++ b/small.txt'), small.stdout)
 
   // 3) diff: none —— 只留统计行
   const silent = await editTool.execute({ file_path: 'small.txt', grep: '^BETA', new_text: 'beta\n', diff: 'none' }, exec)
