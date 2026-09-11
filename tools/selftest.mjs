@@ -25,7 +25,7 @@
  */
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import { apply as applyMask } from '../lib/mask.mjs'
 
@@ -143,10 +143,37 @@ async function sharedSuite(runner) {
     const result = await edit({ file_path: 'amb.md', old_text: 'twin', new_text: 'x' })
     const detail = result.brief + '\n' + result.stderr
     check('edit(ambiguous): refuses to write', !result.ok, JSON.stringify(result))
-    check('edit(ambiguous): explains count/nth', /count|nth/.test(detail), detail)
+    check('edit(ambiguous): explains the count escape hatch', /count/.test(detail), detail)
     const forced = await edit({ file_path: 'amb.md', old_text: 'twin', new_text: 'x', count: 2 })
     const lines = readFileSync(join(ws, 'amb.md'), 'utf8').split(/\r?\n/)
     check('edit(count=2): replaces every occurrence', forced.ok && lines[0] === 'x' && lines[1] === 'x', JSON.stringify(lines))
+  }
+  {
+    // `count` 在三条路径上是一个意思：声明期望命中数，不符即拒绝（此前 `grep` / `lines` 完全忽略它，
+    // 而 `grep` 的报错原文恰恰在建议"用 count 声明命中数"）。
+    await write({ file_path: 'count-grep.md', content: 'k=1\nk=2\nk=3\n' })
+    const linesBefore = readFileSync(join(ws, 'count-grep.md'), 'utf8').split('\n').length
+    const ok = await edit({ file_path: 'count-grep.md', grep: '^k=', count: 3, new_text: 'K=a\nK=b\nK=c\n' })
+    const after = readFileSync(join(ws, 'count-grep.md'), 'utf8')
+    check('edit(grep + count=3): ok and every hit replaced', ok.ok && /K=a/.test(after) && /K=b/.test(after) && /K=c/.test(after) && !/k=\d/.test(after), JSON.stringify(after))
+    check('edit(grep + count=3): the line count is unchanged', after.split('\n').length === linesBefore, JSON.stringify(after))
+
+    await write({ file_path: 'count-lines.md', content: 'k=1\nk=2\nk=3\n' })
+    const seedLines = readFileSync(join(ws, 'count-lines.md'), 'utf8').split('\n').length
+    const wrong = await edit({ file_path: 'count-lines.md', lines: '1:2', count: 9, new_text: 'x\n' })
+    check('edit(lines + count=9): a mismatched declaration refuses', !wrong.ok && /count=9/.test(wrong.stderr), wrong.stderr)
+    check('edit(lines + count mismatch): the file is untouched',
+      readFileSync(join(ws, 'count-lines.md'), 'utf8').split('\n').length === seedLines && !readFileSync(join(ws, 'count-lines.md'), 'utf8').includes('x'), 'the file changed')
+
+    await write({ file_path: 'count-lines-b.md', content: 'k=1\nk=2\nk=3\n' })
+    const right = await edit({ file_path: 'count-lines-b.md', lines: '1:2', count: 2, new_text: 'a\nb\n' })
+    check('edit(lines + count=2): a matching declaration replaces the block',
+      right.ok && readFileSync(join(ws, 'count-lines-b.md'), 'utf8').replace(/\r\n/g, '\n') === 'a\nb\nk=3\n',
+      JSON.stringify(right.brief))
+
+    await write({ file_path: 'count-grep-na.md', content: 'k=1\nk=2\nk=3\n' })
+    const noCount = await edit({ file_path: 'count-grep-na.md', grep: '^k=', new_text: 'x\n' })
+    check('edit(grep, no count): several hits still refuse', !noCount.ok, noCount.brief || noCount.stderr)
   }
 
   {
@@ -183,13 +210,23 @@ async function nodeOnlySuite(ws) {
   const write = async (args) => await applyPlan(planWrite(args), { root: ws })
 
   {
+    // 本包没有路径护栏（见 lib/core.mjs 第二段）：`.dsh/` 内部照写——真实场景里那是"编辑自己的
+    // 备份/台账/被 `.dsh/` 覆盖的仓库文件"这一类需求，禁掉它比放开它的代价更大。
     mkdirSync(join(ws, '.dsh'), { recursive: true })
-    const result = await run({ file_path: '.dsh/scratch.md', grep: 'x', new_text: 'y\n' })
-    check('guard: refuses .dsh/ targets', !result.ok && /拒绝写入/.test(result.stderr), result.stderr)
+    writeFileSync(join(ws, '.dsh', 'scratch.md'), 'x\n')
+    const result = await run({ file_path: '.dsh/scratch.md', old_text: 'x', new_text: 'y' })
+    check('no guard: .dsh/ targets are editable', result.ok && readFileSync(join(ws, '.dsh', 'scratch.md'), 'utf8') === 'y\n', result.stderr)
   }
   {
-    const result = await run({ file_path: '../outside.md', grep: 'x', new_text: 'y\n' })
-    check('guard: refuses paths outside the workspace', !result.ok && /工作区之外/.test(result.stderr), result.stderr)
+    // 工作区之外、相对路径 `.\\..\\` 与中文文件名：lib/ 里那条真实使用路径的回归。
+    const outsideDir = join(dirname(ws), `外部-${basename(ws)}`)
+    mkdirSync(outsideDir, { recursive: true })
+    const outside = join(outsideDir, '外部-文件.md')
+    writeFileSync(outside, '一行\n')
+    const result = await run({ file_path: `../${basename(outsideDir)}/外部-文件.md`, old_text: '一行', new_text: '两行' })
+    check('no guard: paths outside the workspace are editable', result.ok && readFileSync(outside, 'utf8') === '两行\n', result.stderr)
+    check('a path outside the workspace lands in the ledger as an absolute path',
+      readFileSync(join(ws, '.dsh', 'edits.log'), 'utf8').includes(outside.replace(/\\/g, '\\\\')))
   }
   {
     writeFileSync(join(ws, 'binary.bin'), Buffer.from([0x41, 0x00, 0x42, 0x0a]))
@@ -253,6 +290,30 @@ async function nodeOnlySuite(ws) {
     writeFileSync(join(ws, 'relaxed.md'), 'keep   trailing\nnext line\n')
     const result = await run({ file_path: 'relaxed.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n' })
     check('a relaxed match is announced in the brief', result.ok && /宽松/.test(result.brief), result.brief || result.stderr)
+  }
+  {
+    // 宽松命中的 span 是整行块：锚点没写换行结尾时，行尾空白与换行符必须留在文件里，
+    // 否则替换会吃掉换行、把下一行并进来——改一行变成删一行，而模型看不出哪里写错了。
+    writeFileSync(join(ws, 'fuzzy-eol.md'), 'alpha\n   BBBB\ncccc\ndddd\n')
+    const result = await run({ file_path: 'fuzzy-eol.md', old_text: '  BBBB   ', new_text: 'X' })
+    const text = readFileSync(join(ws, 'fuzzy-eol.md'), 'utf8')
+    check('a relaxed hit stays inside its own line', result.ok && text === 'alpha\nX\ncccc\ndddd\n', JSON.stringify(text))
+    check('a relaxed hit keeps the file line count', text.split('\n').length === 5, JSON.stringify(text))
+    check('the eol repair is stated in the brief', /行尾空白与换行符留在原地/.test(result.brief), result.brief)
+  }
+  {
+    // 宽松命中在两处都成立时，绝不按文件顺序悄悄挑第一处：与精确命中同样拒绝写盘。
+    const seed = 'alpha\n   BBBB\ncccc\n   BBBB\ndddd\n'
+    writeFileSync(join(ws, 'fuzzy-ambiguous.md'), seed)
+    const result = await run({ file_path: 'fuzzy-ambiguous.md', old_text: '  BBBB   ', new_text: 'X' })
+    check('a relaxed hit matching twice is refused', !result.ok && /宽松模式/.test(result.stderr), result.stderr)
+    check('a refused relaxed hit leaves the file untouched', readFileSync(join(ws, 'fuzzy-ambiguous.md'), 'utf8') === seed)
+  }
+  {
+    // 锚点带换行、替换文本不带：行会被并起来（README 的既有约定），但要说出来。
+    writeFileSync(join(ws, 'eol-merge.md'), 'alpha\n   BBBB\ncccc\n')
+    const result = await run({ file_path: 'eol-merge.md', old_text: 'BBBB\n', new_text: 'X' })
+    check('a line-absorbing replacement is announced', result.ok && /并成一行/.test(result.brief), result.brief || result.stderr)
   }
   {
     const result = await run({ file_path: 'sample.md', grep: '^one$', new_text: 'one\n' })
@@ -805,7 +866,6 @@ function usageSuite() {
     ['after with old_text', { file_path: 'x', mode: 'after', old_text: 'a', new_text: 'a' }],
     ['bad mode', { file_path: 'x', grep: 'a', new_text: 'a', mode: 'sneak' }],
     ['bad count', { file_path: 'x', grep: 'a', new_text: 'a', count: 0 }],
-    ['count + nth together', { file_path: 'x', grep: 'a', new_text: 'a', count: 2, nth: 1 }],
     ['empty file_path', { file_path: '  ', grep: 'a', new_text: 'a' }],
     ['missing file_path', { grep: 'a', new_text: 'a' }],
     ['missing new_text', { file_path: 'x', grep: 'a' }],

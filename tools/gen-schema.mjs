@@ -80,8 +80,7 @@ const editParametersDsl = {
   grep: { type: 'string', description: 'Regex anchor: the matching line block, its trailing newline included.' },
   lines: { type: 'string', description: 'Line anchor, e.g. "263:270" or "120"; trailing newline included.' },
   mode: { type: 'string', enum: ['replace', 'after', 'before', 'append', 'prepend'], description: 'replace (default) substitutes the anchor; after/before insert beside a grep/lines anchor; append/prepend use the file ends.' },
-  count: { type: 'number', description: 'Require exactly N matches and replace all of them.' },
-  nth: { type: 'number', description: 'Replace only the k-th match (1-based).' },
+  count: { type: 'number', description: 'Declare the expected number of hits (mismatch refuses to write); for `lines` anchors it declares how many lines the anchor covers.' },
 }
 
 /** `write_text` 的作者 DSL。 */

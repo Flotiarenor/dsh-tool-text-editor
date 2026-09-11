@@ -134,15 +134,22 @@ sections are still paid for (that 2362 B), and in exchange the built-ins stay ca
 `file_path` and `new_text` are required; give **exactly one** anchor: `old_text` (literal, copied from
 `read`), `grep` (regex; the matched line/block including its trailing newline), or `lines` (e.g.
 `"263:270"`; also including the trailing newline). `mode` is `replace` (default) / `after` / `before` /
-`append` / `prepend`, plus `count` (require exactly N occurrences and replace all) and `nth` (k-th
-occurrence); `count` and `nth` are mutually exclusive.
+`append` / `prepend`. `count` declares the expected number of hits — occurrences of the literal for
+`old_text` (all of them replaced), regex hits for `grep`, covered lines for `lines` — and any mismatch
+refuses to write.
 
 Both anchor kinds span the line block **with** its trailing newline, so end `new_text` with a newline too —
 otherwise the replacement joins the following line and the file loses a line (the `+1/-2` stat reports it).
 
 Matching runs exact → relaxed (trailing whitespace, line-block similarity) → nearest candidates on a
-miss. A match that hits several places without `nth` / `count` refuses to write. A relaxed hit adds one
+miss. A match that hits several places without `count` refuses to write. A relaxed hit adds one
 `[warn]` line to the result.
+
+**There is no "replace only the k-th hit" parameter.** `count` is the single disambiguation knob, and its
+meaning is *confirmation* (declare how many hits you expect; a mismatch refuses) rather than *selection*
+(take one, leave the rest). To change one occurrence among several, make the anchor unique — quote a longer
+`old_text`, or name the place with `lines` / `grep`. A wrong anchor then fails loudly instead of editing
+the wrong line silently.
 
 ### `write_text` — create or fully replace a file
 
@@ -227,19 +234,24 @@ the tools.
   refuse before any I/O, and the reason says the session policy — not the path — is what refused.
   `sandboxPolicy` is consumed opportunistically (`ctx.get`), so a deployment without it, or a resolver
   that throws, falls back to the previous behaviour instead of bricking writes.
-- **Only the `read-only` mode is mirrored.** `workspace-write` and `danger-full-access` still run
-  through the constant guard below; the plugin does not mirror the host exactly, and it is **not** a
-  security boundary — a shell command can still write anywhere the sandbox allows.
+- **Only `read-only` is mirrored, and no path is restricted.** Under `workspace-write` and
+  `danger-full-access` both tools write **any** path: outside the workspace, inside `.dsh/` or `.git/`,
+  and through a junction / symlink that points out of the workspace. That is a deliberate trade, not an
+  oversight — the path guard this package used to carry decided by **string prefix**, so it could be
+  walked around by a symlink (a guard in appearance only) while it also blocked positions the model is
+  entitled to write in a full-access session. The plugin is therefore **not** a security boundary and
+  does not pretend to replace the host policy, the sandbox or approvals: to restrict where writes may
+  land, use the session file policy, the sandbox and `sandbox_permissions` (or a guard on the shell
+  side) — this package takes no part in that judgement.
 - **Line anchors are not content-verified.** `lines` and `before` / `after <line>` locate text by line
   number alone: a wrong number does not fail, it edits somewhere else. When the anchor has to be
   verifiable, use `old_text` or `grep`.
 - **Per-target serialization is per process.** An in-process queue per target plus an atomic write
   keeps parallel tool calls from overwriting each other, but another dsh instance, an editor or any
   other process writing the same file still can, and external changes are not detected.
-- **UTF-8 text only.** Files containing NUL bytes (binary) or invalid UTF-8 are refused, as are paths
-  inside `.git/` or `.dsh/` and paths outside the workspace; the guard list is a constant, not
-  configuration. (A file marked read-only by the OS is refused too — the atomic rename fails with
-  `EPERM` — and the attribute is never silently cleared.)
+- **UTF-8 text only.** Files containing NUL bytes (binary) or invalid UTF-8 are refused. (A file marked
+  read-only by the OS is refused too — the atomic rename fails with `EPERM` — and the attribute is
+  never silently cleared.)
 - **Creating a file fills in missing parent directories.** When the `write_text` target does not exist,
   parents are created (`mkdir -p`, as the built-in `write` does). The action produces no extra output.
 - **A failed ledger append does not change the write outcome.** Once the target file is written, a
@@ -283,7 +295,8 @@ These live in the repository only: `tools/` is deliberately outside the `files` 
 the published package is just the plugin, its preset installer, the docs and the license.
 
 `tools/selftest.mjs` covers BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, relaxed
-matching reports, usage errors, binary/invalid-UTF-8 refusal, `.dsh/` and outside-workspace guards,
+matching reports, usage errors, binary/invalid-UTF-8 refusal, editable `.dsh/` and outside-workspace
+paths (there is no path guard),
 majority EOL inference, multi-hunk diffs, end-of-file newline changes, concurrent writes,
 parent-directory creation and errno-only failure text — **plus a plugin-layer suite** that drives
 `apply()` with a fake context and asserts tool registration, the guidance section, that every returned
