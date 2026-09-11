@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Flotiarenor
+# SPDX-License-Identifier: Apache-2.0
+# dsh-tool-text-editor bundle patch：把 edit_text / write_text 两个工具行插进 profile 的宿主组合，
+# 从而对**所有**会话可见（不限于某一个 preset）。
+#
+#   dsh plugin --profile web add link:<本仓库的绝对路径>
+#   # 然后重启 dsh web
+#
+# 为什么可以走宿主平面：本插件注册的是 `edit_text` / `write_text` 两个**不与原生工具重名**的工具，
+# 不存在同名注册冲突；它也消费宿主服务（tools / systemPrompt）、不发布任何服务，实现是纯 Node
+# （进程内、零依赖、不启动外部进程），因此宿主平面插入没有额外依赖。
+#
+# 与 preset 安装方式的区别：
+#   * 这里（宿主层）= 每个会话都有这两个工具，任何 preset 都能用；
+#   * `scripts/install-preset.mjs`（preset 层）= 只有选了这个 preset 的会话有，
+#     其它项目/会话的工具表保持干净。
+# 两种方式可以同时存在：preset 层的注册在同名时遮蔽宿主层的，定义相同、行为一致。
+#
+# 卸载：`dsh plugin --profile web remove @flotiarenor/dsh-tool-text-editor`，再重启 dsh web。
+- insert:
+    - id: tool-text-editor
+      name: '@flotiarenor/dsh-tool-text-editor'

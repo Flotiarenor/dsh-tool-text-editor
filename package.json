@@ -1,0 +1,72 @@
+{
+  "name": "@flotiarenor/dsh-tool-text-editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness: they preserve a UTF-8 BOM and the file's own CRLF/LF style (the built-in write/edit tools do not), print a unified diff, back the previous content up, and accept grep/lines anchors. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
+  "type": "module",
+  "main": "lib/editor.mjs",
+  "exports": {
+    ".": "./lib/editor.mjs",
+    "./core": "./lib/core.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node tools/check-license.mjs && node tools/selftest.mjs",
+    "check": "node tools/check-license.mjs",
+    "check:license": "node tools/check-license.mjs",
+    "check:schema": "node tools/gen-schema.mjs",
+    "selftest": "node tools/selftest.mjs",
+    "install:preset": "node scripts/install-preset.mjs",
+    "prepublishOnly": "node tools/check-license.mjs && node tools/selftest.mjs"
+  },
+  "files": [
+    "lib",
+    "preset",
+    "scripts",
+    "tools",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "tool",
+    "editor",
+    "bom",
+    "crlf"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Flotiarenor",
+    "url": "https://github.com/Flotiarenor"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "homepage": "https://github.com/Flotiarenor/dsh-tool-text-editor#readme",
+  "bugs": {
+    "url": "https://github.com/Flotiarenor/dsh-tool-text-editor/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Flotiarenor/dsh-tool-text-editor.git"
+  }
+}
