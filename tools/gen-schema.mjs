@@ -30,6 +30,11 @@ import {
   OUTPUT_SCHEMA,
   WRITE_PARAMETERS,
 } from '../lib/editor.mjs'
+import { DIFF_MODES } from '../lib/core.mjs'
+
+/** `diff` 参数的描述：内嵌 JSON 与这里的 DSL 必须逐字一致。 */
+const DIFF_DESCRIPTION =
+  'Diff detail in the result: auto (default, small changes only) | full (always, capped) | none.'
 
 /**
  * dsh 可能装在任意位置，所以这里按布局枚举候选入口（不写死任何机器上的路径）：
@@ -83,6 +88,7 @@ const editParametersDsl = {
   count: { type: 'number', description: 'Require exactly N occurrences and replace all of them.' },
   nth: { type: 'number', description: 'Replace the k-th occurrence only (1-based).' },
   strict: { type: 'boolean', description: 'Disable relaxed matching.' },
+  diff: { type: 'string', enum: DIFF_MODES, description: DIFF_DESCRIPTION },
   dry_run: { type: 'boolean', description: 'Print the diff without writing.' },
   note: { type: 'string', description: 'One-line reason recorded in the edit ledger.' },
 }
@@ -91,6 +97,7 @@ const editParametersDsl = {
 const writeParametersDsl = {
   file_path: { type: 'string', required: true, description: 'Target file, resolved against the session working directory when relative.' },
   content: { type: 'string', required: true, description: 'Complete new file content.' },
+  diff: { type: 'string', enum: DIFF_MODES, description: DIFF_DESCRIPTION },
   dry_run: { type: 'boolean', description: 'Print the diff without writing.' },
   note: { type: 'string', description: 'One-line reason recorded in the edit ledger.' },
 }
@@ -106,6 +113,8 @@ const outputDsl = {
     dryRun: { type: 'boolean', required: true },
     stdout: { type: 'string', required: true },
     stderr: { type: 'string', required: true },
+    brief: { type: 'string', required: true },
+    diff: { type: 'string', required: true },
   },
 }
 

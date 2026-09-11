@@ -16,7 +16,9 @@
 BOM 字节），且 `writeText` 不按原文件风格还原行尾。
 
 在保真之外，本插件还提供：**统一 diff**（可用 dry-run 预览）、**写入前自动备份**、**编辑台账**、
-**`grep` / `lines` 锚点**（无需人工誊抄原文）、**歧义时拒绝写入**，以及**最接近候选**提示。
+**`grep` / `lines` 锚点**（无需人工誊抄原文）、**歧义时拒绝写入**、**最接近候选**提示，以及
+**面向 token 预算的结果文本**：模型只看到一行统计加受行数预算约束的 diff 正文，完整 diff 走 UI 卡片
+（见「结果文本与 token 预算」）。
 
 ## 实现与依赖
 
@@ -80,6 +82,7 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | `count`     | -    | 要求恰好 N 处命中并全部替换（不符则拒绝写入）。                |
 | `nth`       | -    | 只替换第 k 处（1-based）。                                               |
 | `strict`    | -    | 禁用宽松匹配（只接受精确匹配）。                                         |
+| `diff`      | -    | 结果里 diff 正文的详细程度：`auto`（默认，改动小时才给）/ `full`（总给，仍封顶）/ `none`（不给）。 |
 | `dry_run`   | -    | 只输出 diff，不写入文件。                                                |
 | `note`      | -    | 一行说明，记入编辑台账。                                                 |
 
@@ -88,16 +91,33 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 
 ### `write_text` —— 整文件新建/覆盖
 
-`file_path` + `content`；目标不存在时自动新建，覆盖前先备份。新建文件的行尾风格取自
-同目录的多数派（同扩展名优先），默认不写 BOM。
+`file_path` + `content`（另接受与 `edit_text` 相同的 `diff` / `dry_run` / `note`）；目标不存在时自动
+新建，覆盖前先备份。新建文件的行尾风格取自同目录的多数派（同扩展名优先），默认不写 BOM。
+
+### 结果文本与 token 预算
+
+工具结果会进入 **append-only 的会话历史，永远不会被前缀缓存**，所以每次调用回吐的字节逐次累积。
+因此本插件把结果分成两层：
+
+| 层                       | 内容                                                                            | 去向                        |
+| ------------------------ | ------------------------------------------------------------------------------- | --------------------------- |
+| 模型可见（`brief` / `diff`） | 警告 + 一行统计（如 `replace@60 +1/-1`）+ 受预算约束的 diff 正文（0 上下文行）    | 模型上下文                  |
+| 完整版（`stdout`）        | 路径头、含上下文行的完整 diff、备份名                                            | UI / 日志 / 人工排查        |
+| UI 卡片（`presentationMeta`） | 与原生 `edit` / `write` 同形的 `{ path, oldText, newText }` hunk 列表         | Web UI（**不进模型上下文**） |
+
+- 路径在模型可见文本里**只出现一次**，备份文件名不再回吐（它留在 `stdout` 与编辑台账里）。
+- 正文默认只在改动确实很小时才给（`diff: auto`，阈值见 `maxDiffLines`）；否则只给统计行并提供一行提示，
+  让模型自己决定要不要 `read`。`diff: full` 强制给正文，但**仍然封顶** —— 没有封顶时，一次"整体重写
+  400 行"会把 7.5k tokens 原样回吐（实测回吐量 ≈ 输入内容的 1.0x）。
 
 ## 已知限制
 
 以下均为有意的设计取舍，而非缺陷；采用前请对照自身场景确认。
 
 - **写入不经由 `ctx.fs`。** 文件由本插件直接写入，因此不经过 fs 观察策略（先读后写、版本新鲜度校验）、
-  沙箱与 `sandbox_permissions` 审批升权，也不保留 Windows DACL。对应地，Web UI 不会生成 diff 卡片
-  （模型仍可读到文本 diff）。
+  沙箱与 `sandbox_permissions` 审批升权，也不保留 Windows DACL。原子写由本插件自己保证
+  （同目录临时文件 + fsync + rename），diff 卡片则由 `presentationMeta` 自行提供（原生工具用的是
+  `ctx.fs` 的 `before` / `after`）。
 - **行号锚点不做内容校验。** `lines` 与 `before` / `after <行号>` 仅按行号定位：行号有误不会报错，
   改动会落在非预期位置；定位需要可校验时，请改用 `old_text` 或 `grep`。
 - **同目标串行仅限本进程。** 进程内按目标路径排队，并配合原子写，故并行的工具调用不会相互覆盖；
@@ -115,7 +135,9 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | `ledger`       | `true`          | 往 `artifactsDir/edits.log` 追加一条 JSONL 记录 |
 | `artifactsDir` | `<工作区>/.dsh` | 备份与台账所在目录                               |
 | `newFileBom`   | `false`         | 新建文件时是否写 UTF-8 BOM                       |
-| `context`      | `3`             | unified diff 的上下文行数                        |
+| `context`      | `3`             | **人读** diff 的上下文行数（只影响 `stdout` 与 UI 卡片；模型可见正文固定 0 行） |
+| `diff`         | `'auto'`        | 模型可见 diff 正文的默认策略，可被逐调用的 `diff` 参数覆盖 |
+| `maxDiffLines` | `30`            | 模型可见 diff 正文的行数预算：`auto` 超了就只给统计行，`full` 按它截断 |
 | `root`         | `process.cwd()` | 无 agent 会话时的回退工作区                      |
 
 环境变量 `DSH_TEXT_EDITOR_EOL`（`lf` \| `crlf`）可覆盖**新建文件**的行尾推断。
@@ -124,7 +146,7 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 
 ```powershell
 # 在本仓库根目录执行
-node tools/selftest.mjs        # Windows + Node 24 参考结果 75/75
+node tools/selftest.mjs        # Windows + Node 24 参考结果 92/92
 node tools/check-license.mjs   # 许可证 / 依赖 / 纯 Node 门禁
 node tools/gen-schema.mjs      # 内嵌 schema 是否仍与作者 DSL 一致
 ```
@@ -133,7 +155,9 @@ node tools/gen-schema.mjs      # 内嵌 schema 是否仍与作者 DSL 一致
 二进制与非法 UTF-8、路径护栏（`.dsh/`、工作区之外）、行尾多数派推断、跨多个 hunk、末尾换行差异、
 并发写入不产生半截文件；**并含一层插件层断言**：以模拟 ctx 驱动 `apply()`，验证工具注册、引导段
 身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 输出，以及 config 透传（`root` / `backup` /
-`ledger` / `newFileBom`）。
+`ledger` / `newFileBom`）；**还有一层回吐预算断言**：整体重写不得回吐内容、小改动仍给改动行、
+`diff: none` / `full` 的边界、路径只出现一次、完整 diff 只走 UI 卡片。token 预算是设计约束而非实现
+细节，因此它自带回归测试 —— 否则一次"顺手多打印一点"就能把它悄悄取消掉。
 
 `tools/gen-schema.mjs` 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：它会在 dsh profile 的
 `node_modules` 与 npm 全局目录中自动查找，也可用 `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码为 2。
@@ -141,7 +165,7 @@ node tools/gen-schema.mjs      # 内嵌 schema 是否仍与作者 DSL 一致
 ## 目录结构
 
 ```
-lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、diff、备份、台账、原子写、同目标串行
+lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、diff（含回吐预算）、备份、台账、原子写、同目标串行
 lib/editor.mjs           # 插件本体：schema、参数校验、工具注册（零依赖 ESM，无构建）
 preset/preset.yml        # preset 的名字/描述（dsh 列表里显示的内容）
 scripts/install-preset.mjs  # 从本机 dsh 派生用户 preset
