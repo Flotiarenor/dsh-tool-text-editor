@@ -10,8 +10,10 @@
  *   工具名 | 入参字节 | 模型可见字节 | 倍率 | 行数
  *
  * 另做两项检查：
- *   * **形状与泄漏** —— 成功必须形如 `WROTE <路径>` 加统计/警告行，失败形如 `FAIL <路径>` 加原因；
+ *   * **形状与泄漏** —— 成功必须形如 `WROTE` 加统计/警告行，失败形如 `FAIL` 加原因；
  *     出现 diff 正文、`=== ` 头、`OK ` 尾、备份名或内部临时文件名即报告；
+ *   * **不回显路径** —— 成功结果里**不得**出现本次调用参数中的 `file_path`：结果与调用一一绑定，
+ *     回显它新信息量为零（实测占成功结果字节的 48%）。失败原因**允许**出现路径（它要指名文件）。
  *   * **超限** —— 单条结果超过 `--cap`（默认 1024 B）即报告，配合 `--assert` 时退出码 1。
  *
  * 会话日志为**分帧 zstd**（边运行边追加），Node 的解压 API 只解第一帧，故此处自行按魔数切帧。
@@ -31,11 +33,18 @@ import { zstdDecompressSync } from 'node:zlib'
 
 const WATCHED = ['edit_text', 'write_text']
 /**
- * 模型可见文本的**允许形状**：成功是 `WROTE <路径>` 加可选的一行统计与警告，失败是 `FAIL <路径>`
- * 加原因。除此之外的一切（diff 正文、`=== ` 头、`OK ` 尾、备份名、内部临时文件名）都算泄漏——
+ * 模型可见文本的**允许形状**：成功是 `WROTE` 加可选的一行统计与警告，失败是 `FAIL` 加原因。
+ * 除此之外的一切（diff 正文、`=== ` 头、`OK ` 尾、备份名、内部临时文件名）都算泄漏——
  * 被编辑的文件内容不参与匹配，因为渲染结果里本就不该出现它。
+ *
+ * 关键字后面**不允许**再跟路径：那正是这次要钉住的回归（见文件头"不回显路径"）。
  */
-const ALLOWED_TEXT = /^(WROTE|FAIL)( [^\n]*)?(\n(?!\S*\.tmp\b)[^\n]*)*$/
+const ALLOWED_TEXT = /^(WROTE|FAIL)(\n(?!\S*\.tmp\b)[^\n]*)*$/
+/**
+ * **历史**形状：关键字后跟路径（本插件早期版本的回显）。它只用来把旧会话与新回归区分开——
+ * 旧日志不该让 `--assert` 永远失败，但也不该被当成合格样本（其路径回显正是新形状要消除的东西）。
+ */
+const LEGACY_TEXT = /^(WROTE|FAIL)( [^\n]*)?(\n(?!\S*\.tmp\b)[^\n]*)*$/
 const FORBIDDEN = [/\S*\.tmp\b/, /^=== /m, /^OK /m, /^备份 /m, /^DRY RUN /m]
 const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
 
@@ -110,6 +119,7 @@ function audit(file) {
   const perTool = new Map()
   const rows = []
   const leaks = []
+  let legacyShapes = 0
   for (const event of events) {
     if (event.type !== 'tool/result') continue
     const call = calls.get(event.data?.message?.source?.callId)
@@ -118,9 +128,20 @@ function audit(file) {
       .map((block) => (block.type === 'tool-result' ? (block.content ?? []).map((content) => content.text ?? '').join('') : ''))
       .join('')
     if (WATCHED.includes(name)) {
-      const hit = FORBIDDEN.filter((pattern) => pattern.test(text))
-      if (!ALLOWED_TEXT.test(text)) hit.push(/unexpected shape/)
-      if (hit.length > 0) leaks.push(`${name} (${hit.map(String).join(' ')})`)
+      const legacy = !ALLOWED_TEXT.test(text) && LEGACY_TEXT.test(text)
+      if (legacy) {
+        // 新形状之前的会话：只计数，不当泄漏，也不参与下面的路径回显检查。
+        legacyShapes += 1
+      } else {
+        const hit = FORBIDDEN.filter((pattern) => pattern.test(text))
+        if (!ALLOWED_TEXT.test(text)) hit.push(/unexpected shape/)
+        // 成功结果不得回显路径（失败原因可以，它要指名文件）。
+        const given = call?.arguments?.file_path
+        if (text.startsWith('WROTE') && typeof given === 'string' && given !== '' && text.includes(given)) {
+          hit.push(/echoed file_path/)
+        }
+        if (hit.length > 0) leaks.push(`${name} (${hit.map(String).join(' ')})`)
+      }
     }
     const record = perTool.get(name) ?? { calls: 0, argBytes: 0, visibleBytes: 0, worstBytes: 0, worstLabel: '' }
     record.calls += 1
@@ -144,7 +165,7 @@ function audit(file) {
       })
     }
   }
-  return { perTool, rows, leaks }
+  return { perTool, rows, leaks, legacyShapes }
 }
 
 /** 目标：一个会话文件，或一棵会话目录。 */
@@ -173,11 +194,13 @@ if (files.length === 0) {
 
 let overCap = 0
 let leaked = 0
+let legacy = 0
 let watchedCalls = 0
 let watchedVisible = 0
 
 for (const file of files) {
-  const { perTool, rows, leaks } = audit(file)
+  const { perTool, rows, leaks, legacyShapes } = audit(file)
+  legacy += legacyShapes
   const textTools = [...perTool.entries()].filter(([name]) => WATCHED.includes(name))
   // 有这两个工具的调用就只看它们，否则退化成"这次会话里所有工具"的概览。
   const shown = textTools.length > 0 ? textTools : [...perTool.entries()]
@@ -223,10 +246,12 @@ for (const file of files) {
   for (const row of over) console.log(`  OVER CAP  ${row.visibleBytes} B > ${CAP} B  ${row.name}  ${row.head}`)
   leaked += leaks.length
   if (leaks.length > 0) console.log(`  LEAK  ${leaks.length} result(s) with unexpected text: ${[...new Set(leaks)].slice(0, 3).join(' | ')}`)
+  if (legacyShapes > 0) console.log(`  LEGACY  ${legacyShapes} result(s) in the older shape (WROTE/FAIL followed by a path); pre-change sessions only`)
 }
 
 console.log('')
 console.log(`scanned ${files.length} session log(s): ${watchedCalls} text-editor calls, ${watchedVisible} B of model-visible text total`)
 console.log(leaked === 0 ? 'text check        : every result matches the documented shape' : `text check        : ${leaked} result(s) with unexpected text`)
+console.log(legacy === 0 ? 'legacy check      : no pre-change results found' : `legacy check      : ${legacy} result(s) from before the path echo was dropped (informational)`)
 console.log(overCap === 0 ? `cap check         : every result <= ${CAP} B` : `cap check         : ${overCap} result(s) over ${CAP} B`)
 if (ASSERT && (leaked > 0 || overCap > 0)) process.exitCode = 1

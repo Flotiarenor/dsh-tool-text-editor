@@ -94,27 +94,53 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 
 ### 返回值
 
-两个工具返回同一份规范值（`OUTPUT_SCHEMA`），只有四个字段：
+两个工具返回同一份规范值（`OUTPUT_SCHEMA`）。前四个字段是**模型通道**的依据（`render` 只读它们），
+其余是**呈现通道**（GUI 的 diff 卡片）的载荷，只经 `output.presentationMeta` 投影进会话日志，
+永不进入模型上下文。失败值只有前四个字段。
 
 | 字段       | 内容                                             | 去向       |
 | ---------- | ------------------------------------------------ | ---------- |
-| `path`   | 调用方给出的目标路径（原样回填）                 | —          |
+| `path`   | 调用方给出的目标路径                             | 仅规范值，**不渲染** |
 | `ok`     | 是否写入成功                                     | —          |
 | `brief`  | 一行统计（如 `replace@17 +1/-1`）与必要的警告行  | 模型上下文 |
 | `stderr` | 失败原因（失败时非空）                           | 模型上下文 |
+| `operation` | `create` 或 `update`                         | 卡片标题   |
+| `hunks`  | 实际落盘的改动，逐 hunk 一对 `{ oldText, newText }`（含上下文行） | GUI 卡片 |
+| `hunksTruncated` | 卡片载荷是否触到上限                      | 卡片标题   |
 
 模型可见文本因此只有两种形状：
 
 ```
-WROTE <路径>            # 成功：一行统计 + 警告
+WROTE                   # 成功：一行统计 + 警告
 replace@17 +1/-1
-FAIL <路径>             # 失败：完整原因（决定下一次调用）
+FAIL                    # 失败：完整原因（决定下一次调用）
 <原因>
 ```
 
 **成功路径不回显改动内容**：工具结果按追加方式进入会话历史，任何内容回显都会随调用次数累积，而
 调用方刚发过 `new_text`；`replace@17 +1/-1` 已说明改在哪几行、改了多少，需要看正文时 `read` 一次
-即可。因此单次调用的模型可见字节与输入规模无关（实测：400 KB 的单行写入仍只回 2 行 / 90 B）。
+即可。因此单次调用的模型可见字节与输入规模无关（实测：400 KB 的单行写入仍只回 2 行 / 17 B）。
+
+**成功路径也不回显路径**：结果与调用一一绑定（`tool/result` 带 `source.callId`），调用方自己那条
+`file_path` 参数就在同一轮历史里，逐字回显它新信息量为零——而它并不便宜：在本机 79 个会话、86 条
+当前形状的结果里，一次成功平均 116 B，其中 `WROTE <路径>` 一行占 **55.6 B（48%）**；去掉路径后
+平均 66 B（−43%）。路径仍然出现在**它真正携带信息**的两处：需要指名文件的失败**原因**里，以及
+下面的 GUI 卡片上。
+
+### 呈现通道（GUI 的 diff 卡片）
+
+两个工具声明了 `presentCall`、`output.presentationMeta` 与 `presentResult`：
+
+- `presentCall(args)` 用调用参数画出**待定卡片**（`edit_text` 是 diff，`write_text` 是整篇覆盖形状；
+  `grep` / `lines` 锚点没有现成的 old 文本，按新增侧展示）；
+- `presentationMeta(args, value)` 投影**实际落盘**的 hunk——文件身份与真正的改动落在这里，而不是
+  模型的上下文里；
+- `presentResult(args, result)` 把持久化的投影窄化回 `DiffResultView`；投影缺失、为空或畸形时一律
+  回落到原始结果文本。
+
+投影会随会话日志持久化，因此有上限：`lib/core.mjs` 里的 `PRESENT_MAX_HUNKS`（40）与
+`PRESENT_MAX_BYTES`（4096）。整篇重写这类超限改动会丢掉卡片正文、只在标题标注 `（部分 diff）`
+——宁可卡片没内容，也不把整个文件塞进会话日志。
 
 改动记录由备份与台账承担，二者都不进入模型上下文：`.dsh/backups/` 下的原件副本，以及
 `.dsh/edits.log` 的 JSONL（字段见「目录结构」之后）。
@@ -128,19 +154,25 @@ FAIL <路径>             # 失败：完整原因（决定下一次调用）
 
 - **写入不经由 `ctx.fs`。** 文件由本插件直接写入，因此不经过 fs 观察策略（先读后写、版本新鲜度校验）、
   沙箱与 `sandbox_permissions` 审批升权，也不保留 Windows DACL。原子写由本插件自行实现
-  （同目录临时文件 + fsync + rename）。
+  （同目录临时文件 + fsync + rename）。正因为这条路径上没有第二个强制点，插件把会话自己的文件策略里
+  **唯一禁止写入的那一档**镜像了回来：`read-only` 会话下两个工具都在任何 I/O 之前拒写，原因里点明
+  这是会话策略而非路径问题。`sandboxPolicy` 是可选消费（`ctx.get`），服务缺席或解析抛错时退回既有
+  行为，不会把写盘全禁掉。
+- **只镜像了 `read-only` 一档。** `workspace-write` 与 `danger-full-access` 仍走下面的常量护栏；
+  本插件并不精确复刻宿主策略，也**不是安全边界**——shell 命令照样能写到沙箱允许的任何地方。
 - **行号锚点不做内容校验。** `lines` 与 `before` / `after <行号>` 仅按行号定位：行号有误不会报错，
   改动会落在非预期位置；定位需要可校验时，请改用 `old_text` 或 `grep`。
 - **同目标串行仅限本进程。** 进程内按目标路径排队，并配合原子写，故并行的工具调用不会相互覆盖；
   但另一个 dsh 实例、编辑器或其它进程同时修改同一文件时，仍可能相互覆盖，本插件也不检测外部改动。
 - **仅处理 UTF-8 文本。** 含 NUL 字节的二进制文件与非法 UTF-8 文件一律拒绝；`.git/`、`.dsh/` 内部
-  以及工作区之外的路径一律拒绝写入（护栏是常量，不可配置）。
+  以及工作区之外的路径一律拒绝写入（护栏是常量，不可配置）。被操作系统标记为只读的文件同样拒绝
+  （原子 rename 会以 `EPERM` 失败），并且**不会**悄悄清掉那个属性。
 - **新建文件会补齐缺失的父目录。** `write_text` 目标不存在时按 `mkdir -p` 补齐（与原生 `write` 一致）；
   该动作不产生额外输出。
 - **台账失败不改变写入结果。** 目标文件写入成功后，台账失败只在结果里追加一行 `[warn]`，`ok` 仍为真；
   否则调用方会重试，导致同一次编辑写入两次。
-- **GUI 里没有 diff 卡片。** 工具不提供 `presentResult` / `presentationMeta`，Web UI 显示的就是模型
-  可见的那两行；审阅改动请用备份、台账或项目自身的 git 差异（如右侧变更面板）。
+- **卡片载荷有上限，所以超大改动看不到 diff。** 超过上面的 hunk 条数 / 字节上限时卡片正文为空、标题
+  标注 `（部分 diff）`；那两行原始结果仍是记录。
 
 ## 配置
 
@@ -160,7 +192,7 @@ FAIL <路径>             # 失败：完整原因（决定下一次调用）
 
 ```powershell
 # 在本仓库根目录执行
-node tools/selftest.mjs                 # Windows + Node 24 参考结果 80/80
+node tools/selftest.mjs                 # Windows + Node 24 参考结果 105/105
 node tools/check-license.mjs            # 许可证 / 依赖 / 纯 Node 门禁
 node tools/gen-schema.mjs               # 内嵌 schema 是否仍与作者 DSL 一致
 node tools/measure-context.mjs          # 逐场景量模型可见字节
@@ -168,14 +200,17 @@ node tools/audit-session.mjs            # 用真实会话日志对账（含文�
 ```
 
 `npm test` 串起许可证门禁、自测与 `measure-context --cap 2048`；后者保证任何一次调用的模型可见文本
-都不超过 2 KB——当前实现的最坏场景是 1.6 KB 的歧义提示，成功路径固定 2 行 / 约 90 B。
+都不超过 2 KB——当前实现的最坏场景是 1.6 KB 的歧义提示，成功路径固定 2 行 / 17–21 B。
 
 `tools/selftest.mjs` 覆盖：BOM 与行尾保真、四种锚点、`count`、歧义时拒绝写入、宽松匹配通报、用法错误、
 二进制与非法 UTF-8、路径护栏（`.dsh/`、工作区之外）、行尾多数派推断、多 hunk、末尾换行差异、并发写入
 不产生半截文件、新建时补齐父目录、系统调用失败只报 errno；**并含一层插件层断言**：以模拟 ctx 驱动
 `apply()`，验证工具注册、引导段身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 的字面形状，以及
-config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**以及一层返回值约束断言**：无论输入多大，
-成功路径都只有两行，且不含改动内容。
+config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**一层返回值约束断言**：无论输入多大，
+成功路径都只有两行、不含改动内容、也不重复路径；**一层呈现层断言**：`presentCall` 的形状、实际 hunk
+的投影、回放窄化、投影缺失/为空/畸形时的降级，以及卡片上限；**以及一层策略断言**：`read-only` 下
+两个工具在任何 I/O 之前拒写（不留字节、不留备份），`workspace-write` / `danger-full-access` 照旧写，
+策略服务缺席或抛错不误伤写入。
 
 ### 上下文开销的测量
 
@@ -183,9 +218,10 @@ config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**以及一层�
 逐场景输出入参字节、模型可见字节、倍率与行数。`--cap N`：任一场景超过 N 字节即退出码 1。`--static`
 输出每请求的静态开销；`--vs-native` 追加宿主 `write` / `edit` 的同一组数据（未找到 dsh 安装时输出 SKIP）。
 
-`tools/audit-session.mjs` 以真实会话日志（`<DSH_HOME>/sessions/`，分帧 zstd，按调用对账）核对两项：
+`tools/audit-session.mjs` 以真实会话日志（`<DSH_HOME>/sessions/`，分帧 zstd，按调用对账）核对三项：
 结果文本的形状是否符合上面两种之一（出现 diff 正文、`=== ` 头、`OK ` 尾、备份名或内部临时文件名即
-报告）、单条结果是否超过 `--cap`（默认 1024 B）。
+报告）、成功结果是否回显了本次调用自己的 `file_path`（那正是这次形状要杜绝的回归），以及单条结果是否
+超过 `--cap`（默认 1024 B）。
 
 `tools/gen-schema.mjs` 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：它会在 dsh profile 的
 `node_modules` 与 npm 全局目录中自动查找，也可用 `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码为 2。

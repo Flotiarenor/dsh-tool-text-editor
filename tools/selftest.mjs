@@ -3,7 +3,7 @@
 /**
  * selftest.mjs —— `lib/` 的端到端自测（不需要 dsh 会话）。
  *
- * 三层断言：
+ * 六层断言：
  *   * 共享行为 —— 通过 `applyPlan` 直接跑核心（BOM/行尾保真、锚点、匹配、count、歧义拒写）；
  *   * Node 独有保证 —— 路径护栏、二进制/非法 UTF-8 拒写、多数派行尾推断、多 hunk、并发不撕裂、
  *     新建时补齐父目录、系统调用失败只报 errno；
@@ -11,8 +11,11 @@
  *     参数校验、**返回值与 `OUTPUT_SCHEMA` 一致**、`render()` 文本，以及 config
  *     （`root` / `backup` / `ledger` / `newFileBom`）的透传。这一层是宿主真正调用的入口，必须被测到，
  *     否则 schema 与返回值脱节也只能等线上发现；
- *   * 返回值约束 —— 模型可见文本的构成本身是被断言对象：无论输入多大，成功路径固定为
- *     `WROTE <路径>` 加一行统计，且不含改动内容。这是工具契约的一部分，因此需要回归测试。
+ *   * 返回值约束 —— 模型可见文本的构成本身是被断言对象：无论输入多大，成功路径固定为 `WROTE`
+ *     加一行统计，不含改动内容，**也不重复路径**。这是工具契约的一部分，因此需要回归测试；
+ *   * 呈现层 —— `presentCall` / `presentationMeta` / `presentResult` 的形状、投影与降级：
+ *     宿主在实时渲染与日志回放两条路径上都调用它们，抛异常就会被降级成通用卡片；
+ *   * 会话文件策略 —— `read-only` 下两个工具在任何 I/O 之前拒写，且不误伤其它模式。
  *
  * 实现全部是进程内 Node（不启动子进程、无外部运行时），所以自测本身也只依赖 Node。
  *
@@ -70,13 +73,22 @@ function makeWorkspace(prefix) {
 /**
  * 工具返回值必须**恰好**满足 `OUTPUT_SCHEMA`：宿主按它校验，schema 与实现脱节就是线上故障。
  * （`additionalProperties: false`：多一个字段、少一个字段、类型不对都算失败。）
+ *
+ * 类型判定覆盖本 schema 用到的三种写法：`type`（含 `array`）、`oneOf`（可空字符串）。
  */
+function valueMatchesSpec(value, spec) {
+  if (Array.isArray(spec.oneOf)) return spec.oneOf.some((branch) => valueMatchesSpec(value, branch))
+  if (spec.type === 'array') return Array.isArray(value)
+  if (spec.type === 'object') return value !== null && typeof value === 'object' && !Array.isArray(value)
+  return typeof value === spec.type
+}
+
 function assertShape(label, value) {
   const allowed = new Set(Object.keys(OUTPUT_SCHEMA.properties))
   const missing = OUTPUT_SCHEMA.required.filter((key) => !(key in value))
   const extra = Object.keys(value).filter((key) => !allowed.has(key))
   const wrong = Object.entries(OUTPUT_SCHEMA.properties)
-    .filter(([key, spec]) => typeof value[key] !== spec.type)
+    .filter(([key, spec]) => key in value && !valueMatchesSpec(value[key], spec))
     .map(([key]) => key)
   check(label, missing.length === 0 && extra.length === 0 && wrong.length === 0, `missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)} wrongType=${JSON.stringify(wrong)}`)
 }
@@ -253,7 +265,16 @@ async function nodeOnlySuite(ws) {
       result.stderr || JSON.stringify(result),
     )
     check('write(create) keeps the brief to one stat line', result.brief === 'write +2/-0', JSON.stringify(result.brief))
-    check('write(create) returns only the documented fields', Object.keys(result).sort().join(',') === 'brief,ok,path,stderr', Object.keys(result).join(','))
+    check(
+      'write(create) returns the documented fields, model channel plus presentation payload',
+      Object.keys(result).sort().join(',') === 'brief,hunks,hunksTruncated,ok,operation,path,stderr',
+      Object.keys(result).join(','),
+    )
+    check(
+      'write(create) marks the operation and offers a whole-file hunk',
+      result.operation === 'create' && result.hunks.length === 1 && result.hunks[0].oldText === null && result.hunks[0].newText === 'a\nb\n',
+      JSON.stringify(result.hunks),
+    )
   }
   {
     // 系统调用失败：只给 errno 说法；内部临时文件名（.<名字>.<pid><ts>.tmp）绝不出现在原因里
@@ -320,8 +341,8 @@ async function pluginSuite() {
     )
     const rendered = editTool.output.render({}, result)
     check(
-      'plugin: success render is WROTE plus one stat line, and never echoes the change',
-      rendered[0].text === 'WROTE plugin.md\nreplace@2 +1/-1',
+      'plugin: success render is WROTE plus one stat line, and never echoes the path or the change',
+      rendered[0].text === 'WROTE\nreplace@2 +1/-1',
       rendered[0].text,
     )
 
@@ -346,7 +367,7 @@ async function pluginSuite() {
     const result = await editTool.execute({ file_path: 'plugin.md', new_text: 'x' }, exec)
     assertShape('plugin: usage-error result matches OUTPUT_SCHEMA', result)
     check('plugin: a usage error is a result, not a throw', result.ok === false && /anchor/.test(result.stderr), result.stderr)
-    check('plugin: failure render says FAIL', editTool.output.render({}, result)[0].text.startsWith('FAIL plugin.md'))
+    check('plugin: failure render says FAIL without echoing the path', editTool.output.render({}, result)[0].text.startsWith('FAIL\n'))
     check('plugin: failure render keeps the reason', editTool.output.render({}, result)[0].text.includes('anchor'))
   }
   rmSync(ws, { recursive: true, force: true })
@@ -370,9 +391,14 @@ async function pluginSuite() {
 /**
  * 返回值约束：模型可见文本的构成。
  *
- * 契约只有两条：成功是 `WROTE <路径>` 加**一行统计**（不回显改动内容），失败是 `FAIL <路径>` 加完整
- * 原因。这里把"任何规模的改动都不回显"钉成断言——旧实现曾把整文件 diff 当成结果正文，长行的
- * 改动甚至以 1.0x 的放大率原样进入上下文。
+ * 契约只有两条：成功是 `WROTE` 加**一行统计**（不回显改动内容），失败是 `FAIL` 加完整原因。
+ * 这里把"任何规模的改动都不回显"钉成断言——旧实现曾把整文件 diff 当成结果正文，长行的改动甚至
+ * 以 1.0x 的放大率原样进入上下文。
+ *
+ * 另加一条：**不回显路径**。结果与调用一一绑定（`tool/result` 带 `source.callId`），调用参数里的
+ * `file_path` 就在同一轮历史里，逐字回显它新信息量为零（实测占成功结果字节的 48%）。路径该出现的
+ * 地方有两处，都在本文件里断言：失败**原因**要指名文件时自己带上（见下），以及呈现通道的卡片
+ * （见 `presentationSuite`）。
  */
 async function resultTextSuite() {
   const ws = makeWorkspace('dsh-selftest-result-')
@@ -394,19 +420,19 @@ async function resultTextSuite() {
   const createdText = textOf(writeTool, created)
   check(
     'result: a large write does not echo the content back',
-    !createdText.includes('line 30 of the big file') && createdText === 'WROTE big.txt\nwrite +60/-0',
+    !createdText.includes('line 30 of the big file') && createdText === 'WROTE\nwrite +60/-0',
     createdText,
   )
-  check('result: the path appears exactly once in the rendered text', createdText.split('big.txt').length - 1 === 1, createdText)
+  check('result: the rendered text never repeats the path', !createdText.includes('big.txt'), createdText)
 
   // 2) 小改动同样是两行
   writeSample(join(ws, 'small.txt'), ['alpha', 'beta', 'gamma'])
   const small = await editTool.execute({ file_path: 'small.txt', grep: '^beta', new_text: 'BETA\n' }, exec)
   const smallText = textOf(editTool, small)
-  check('result: a small edit reports the stat line only', smallText === 'WROTE small.txt\nreplace@2 +1/-1', smallText)
+  check('result: a small edit reports the stat line only', smallText === 'WROTE\nreplace@2 +1/-1', smallText)
   check(
-    'result: no diff body, no backup name, no change content',
-    !smallText.includes('BETA') && !smallText.includes('beta') && !smallText.includes('备份'),
+    'result: no diff body, no backup name, no change content, no path',
+    !smallText.includes('BETA') && !smallText.includes('beta') && !smallText.includes('备份') && !smallText.includes('small.txt'),
     smallText,
   )
 
@@ -416,31 +442,206 @@ async function resultTextSuite() {
   const longText = textOf(writeTool, longWrite)
   check(
     'result: a single 20 KB line is not echoed',
-    longText === 'WROTE min.js\nwrite +1/-0' && Buffer.byteLength(longText, 'utf8') < 64,
+    longText === 'WROTE\nwrite +1/-0' && Buffer.byteLength(longText, 'utf8') < 32,
     `${Buffer.byteLength(longText, 'utf8')} B\n${longText}`,
   )
 
   // 4) 宽文件（行数少、行长）同样不回显
   const wide = Array.from({ length: 20 }, (_, i) => `L${i} ${'y'.repeat(5000)}`).join('\n') + '\n'
   const wideText = textOf(writeTool, await writeTool.execute({ file_path: 'wide.txt', content: wide }, exec))
-  check('result: 20 lines x 5 KB is not echoed', wideText === 'WROTE wide.txt\nwrite +20/-0', wideText)
+  check('result: 20 lines x 5 KB is not echoed', wideText === 'WROTE\nwrite +20/-0', wideText)
 
   // 5) 一次调用回吐的字节与输入规模无关：这是本契约的核心
   const hugeText = textOf(writeTool, await writeTool.execute({ file_path: 'huge.txt', content: 'z'.repeat(400000) + '\n' }, exec))
   check(
     'result: a 400 KB write still returns a two-line result',
-    hugeText === 'WROTE huge.txt\nwrite +1/-0',
+    hugeText === 'WROTE\nwrite +1/-0',
     `${Buffer.byteLength(hugeText, 'utf8')} B\n${hugeText}`,
   )
 
-  // 6) 失败路径相反：原因必须完整
+  // 6) 失败路径相反：原因必须完整；要指名文件时由**原因**自己带（不是表头回显）
   const missing = await editTool.execute({ file_path: 'nope.md', grep: 'x', new_text: 'y\n' }, exec)
   const failText = textOf(editTool, missing)
   check(
     'result: a failure keeps the full reason',
-    failText.startsWith('FAIL nope.md\n') && failText.includes('目标不存在'),
+    failText.startsWith('FAIL\n') && failText.includes('目标不存在：nope.md'),
     failText,
   )
+
+  // 7) 呈现通道拿到了模型通道刻意丢弃的东西：文件身份与真正的改动
+  const meta = editTool.output.presentationMeta({ file_path: 'small.txt' }, small)
+  const metaBytes = Buffer.byteLength(JSON.stringify(meta), 'utf8')
+  check(
+    'result: the card carries the path and the applied hunk instead of the model text',
+    meta.title === 'Edit small.txt' && meta.diffs.length === 1 && meta.diffs[0].newText.includes('BETA'),
+    JSON.stringify(meta),
+  )
+  check('result: the card payload stays small for a one-line edit', metaBytes < 256, `${metaBytes} B`)
+
+  rmSync(ws, { recursive: true, force: true })
+}
+
+/**
+ * 呈现层契约：三个 presenter 都是宿主在**实时渲染与日志回放**两条路径上调用的纯函数。
+ *
+ * 抛异常只会被 api-proxy 捕获并降级成通用卡片（等于这段功能白写），所以这里既断言形状，也断言
+ * "畸形输入不抛异常、返回 undefined 或空 diffs"这类降级行为。
+ */
+async function presentationSuite() {
+  const ws = makeWorkspace('dsh-selftest-present-')
+  const registered = []
+  apply(
+    { systemPrompt: { section: () => {} }, tools: { register: (value) => registered.push(value) } },
+    { root: ws },
+  )
+  const byName = new Map(registered.map((tool) => [tool.name, tool]))
+  const editTool = byName.get('edit_text')
+  const writeTool = byName.get('write_text')
+  const exec = { agent: { session: { header: { cwd: ws } } } }
+
+  // 待定卡片：完全来自参数（未校验），所以每一步都要窄化
+  const editCall = editTool.presentCall({ file_path: 'a.md', old_text: 'beta\n', new_text: 'BETA\n' })
+  check(
+    'present: edit_text call card is a diff with the path and the literal anchor',
+    editCall.card === 'diff' && editCall.title === 'Edit a.md' && editCall.diffs[0].path === 'a.md'
+      && editCall.diffs[0].oldText === 'beta\n' && editCall.locations[0].path === 'a.md',
+    JSON.stringify(editCall),
+  )
+  const writeCall = writeTool.presentCall({ file_path: 'b.md', content: 'x\n' })
+  check(
+    'present: write_text call card shows a create-shaped diff',
+    writeCall.card === 'diff' && writeCall.title === 'Write b.md' && writeCall.diffs[0].oldText === null && writeCall.diffs[0].newText === 'x\n',
+    JSON.stringify(writeCall),
+  )
+  check(
+    'present: call cards tolerate unvalidated args',
+    editTool.presentCall({}) === undefined && editTool.presentCall('nope') === undefined
+      && writeTool.presentCall({ file_path: 'b.md' }) === undefined && writeTool.presentCall(null) === undefined,
+  )
+  const anchorCall = editTool.presentCall({ file_path: 'a.md', grep: '^beta', new_text: 'BETA\n' })
+  check('present: an anchor call has no old text, so it shows as an insertion', anchorCall.diffs[0].oldText === null, JSON.stringify(anchorCall.diffs))
+
+  // 结果侧：投影 → 回放
+  writeSample(join(ws, 'p.md'), ['alpha', 'beta', 'gamma'])
+  const edited = await editTool.execute({ file_path: 'p.md', grep: '^beta', new_text: 'BETA\n' }, exec)
+  const meta = editTool.output.presentationMeta({ file_path: 'p.md' }, edited)
+  check(
+    'present: the projection carries the applied hunk with context',
+    meta.diffs.length === 1 && meta.diffs[0].oldText === 'alpha\nbeta\ngamma' && meta.diffs[0].newText === 'alpha\nBETA\ngamma',
+    JSON.stringify(meta),
+  )
+  const replayed = editTool.presentResult({ file_path: 'p.md' }, { content: [], isError: false, meta })
+  check(
+    'present: presentResult replays the card from the persisted meta',
+    replayed.card === 'diff' && replayed.title === 'Edit p.md' && replayed.diffs.length === 1,
+    JSON.stringify(replayed),
+  )
+  check(
+    'present: malformed or empty meta degrades to the raw text (no throw)',
+    editTool.presentResult({}, { content: [], isError: false }) === undefined
+      && editTool.presentResult({}, { content: [], isError: false, meta: { diffs: [] } }) === undefined
+      && editTool.presentResult({}, { content: [], isError: false, meta: { diffs: [{ path: 7 }] } }) === undefined
+      && editTool.presentResult({}, { content: [], isError: true, meta }) === undefined
+      && editTool.presentResult({}, null) === undefined,
+  )
+  const failedMeta = editTool.output.presentationMeta({ file_path: 'p.md' }, { path: 'p.md', ok: false, brief: '', stderr: 'x' })
+  check('present: a failed result projects no diffs', Array.isArray(failedMeta.diffs) && failedMeta.diffs.length === 0, JSON.stringify(failedMeta))
+
+  // 整篇重写：卡片载荷封顶，超限时标题标注"部分 diff"，回放时退回原始文本
+  const huge = Array.from({ length: 400 }, (_, i) => `line ${i} ${'x'.repeat(60)}`).join('\n') + '\n'
+  const hugeWrite = await writeTool.execute({ file_path: 'huge.md', content: huge }, exec)
+  const hugeMeta = writeTool.output.presentationMeta({ file_path: 'huge.md' }, hugeWrite)
+  check(
+    'present: an oversized change truncates the card instead of the session log',
+    hugeWrite.hunksTruncated === true && hugeWrite.hunks.length === 0 && hugeMeta.diffs.length === 0 && /部分 diff/.test(hugeMeta.title),
+    `${hugeWrite.hunks.length} ${hugeMeta.title}`,
+  )
+  check(
+    'present: a truncated card degrades to the raw text at replay',
+    writeTool.presentResult({ file_path: 'huge.md' }, { content: [], isError: false, meta: hugeMeta }) === undefined,
+  )
+  // 边界：多命中（同一调用里的多个 hunk）但仍在预算内的改动照样成卡
+  writeFileSync(join(ws, 'many.md'), Array.from({ length: 12 }, () => 'x').join('\n') + '\n')
+  const manyEdit = await editTool.execute({ file_path: 'many.md', old_text: 'x\n', new_text: 'y\n', count: 12 }, exec)
+  const manyMeta = editTool.output.presentationMeta({ file_path: 'many.md' }, manyEdit)
+  check(
+    'present: a 12-hit edit stays within budget',
+    manyEdit.ok === true && manyMeta.diffs.length === 1 && manyEdit.hunksTruncated === false,
+    JSON.stringify([manyMeta.diffs.length, manyEdit.hunksTruncated, manyEdit.stderr]),
+  )
+
+  rmSync(ws, { recursive: true, force: true })
+}
+
+/**
+ * 会话文件策略：`read-only` 时本插件必须一并拒写。
+ *
+ * 本插件的写盘**绕开 `ctx.fs`**（fs seam 的变更原语只有 `writeText`/`editText`，会丢 BOM、拍平
+ * CRLF），所以沙箱、审批、`fs/observed` 都不在这条路径上；`sandboxPolicy` 是唯一能问出模式的地方，
+ * 于是把它镜像回来。三档都要断言：只读拒、非只读照旧、服务缺席或解析失败时不误伤。
+ */
+async function policySuite() {
+  const ws = makeWorkspace('dsh-selftest-policy-')
+  const registered = []
+  let mode = 'workspace-write'
+  const ctx = {
+    systemPrompt: { section: () => {} },
+    tools: { register: (value) => registered.push(value) },
+    get: (name) => (name === 'sandboxPolicy' ? { resolve: () => ({ mode, workspaceRoot: ws }) } : undefined),
+  }
+  apply(ctx, { root: ws })
+  const byName = new Map(registered.map((tool) => [tool.name, tool]))
+  const editTool = byName.get('edit_text')
+  const writeTool = byName.get('write_text')
+  const exec = { agent: { session: { header: { cwd: ws } } } }
+
+  const sample = join(ws, 'policy.md')
+  writeSample(sample, ['alpha', 'beta', 'gamma'])
+  const edited = await editTool.execute({ file_path: 'policy.md', grep: '^beta', new_text: 'BETA\n' }, exec)
+  check('policy: workspace-write still writes', edited.ok === true, edited.stderr)
+
+  mode = 'read-only'
+  const snapshot = readFileSync(sample)
+  const backupsBefore = existsSync(join(ws, '.dsh', 'backups')) ? readdirSync(join(ws, '.dsh', 'backups')).length : 0
+  const refused = await editTool.execute({ file_path: 'policy.md', grep: '^BETA', new_text: 'no\n' }, exec)
+  check(
+    'policy: read-only refuses and names the policy',
+    refused.ok === false && /当前文件策略 read-only/.test(refused.stderr),
+    refused.stderr,
+  )
+  check('policy: the refusal is not a path complaint', !/工作区之外/.test(refused.stderr), refused.stderr)
+  check('policy: the target keeps its bytes', readFileSync(sample).equals(snapshot))
+  const backupsAfter = existsSync(join(ws, '.dsh', 'backups')) ? readdirSync(join(ws, '.dsh', 'backups')).length : 0
+  check('policy: a refusal writes no backup of its own', backupsAfter === backupsBefore, `${backupsBefore} -> ${backupsAfter}`)
+  const refusedCreate = await writeTool.execute({ file_path: 'fresh.md', content: 'x\n' }, exec)
+  check('policy: read-only refuses creates too', refusedCreate.ok === false && !existsSync(join(ws, 'fresh.md')), refusedCreate.stderr)
+  assertShape('policy: a refusal still matches OUTPUT_SCHEMA', refused)
+  check(
+    'policy: the refusal renders as FAIL plus the reason',
+    editTool.output.render({}, refused)[0].text === 'FAIL\n当前文件策略 read-only，拒绝写入（策略来自会话设置，不是路径问题）。',
+    editTool.output.render({}, refused)[0].text,
+  )
+
+  mode = 'danger-full-access'
+  const allowed = await editTool.execute({ file_path: 'policy.md', grep: '^BETA', new_text: 'BETA2\n' }, exec)
+  check('policy: danger-full-access keeps the existing guard behaviour', allowed.ok === true, allowed.stderr)
+
+  // 模拟 ctx（没有 `get`）与解析失败都必须退回既有行为，不能把写盘全禁掉
+  const plain = []
+  apply({ systemPrompt: { section: () => {} }, tools: { register: (v) => plain.push(v) } }, { root: ws })
+  const plainWrite = await plain.find((tool) => tool.name === 'write_text').execute({ file_path: 'plain.md', content: 'x\n' }, exec)
+  check('policy: a ctx without sandboxPolicy still writes', plainWrite.ok === true, plainWrite.stderr)
+  const throwing = []
+  apply(
+    {
+      systemPrompt: { section: () => {} },
+      tools: { register: (v) => throwing.push(v) },
+      get: () => ({ resolve: () => { throw new Error('policy service down') } }),
+    },
+    { root: ws },
+  )
+  const throwingWrite = await throwing.find((tool) => tool.name === 'write_text').execute({ file_path: 'throwing.md', content: 'x\n' }, exec)
+  check('policy: a failing resolver does not brick writes', throwingWrite.ok === true, throwingWrite.stderr)
 
   rmSync(ws, { recursive: true, force: true })
 }
@@ -506,6 +707,14 @@ await pluginSuite()
 console.log('')
 console.log('── plugin: model-facing result text ──')
 await resultTextSuite()
+
+console.log('')
+console.log('── plugin: presentation cards (presentCall / presentationMeta / presentResult) ──')
+await presentationSuite()
+
+console.log('')
+console.log('── plugin: session file policy (read-only refusal) ──')
+await policySuite()
 
 console.log('')
 console.log('── usage errors ──')

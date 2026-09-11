@@ -90,7 +90,13 @@ const writeParametersDsl = {
   content: { type: 'string', required: true, description: 'Complete new file content.' },
 }
 
-/** 两个工具共用的规范返回值。一切都在进程内完成，所以只有结果，没有退出码或后端标记。 */
+/**
+ * 两个工具共用的规范返回值。
+ *
+ * 前四个字段是**模型通道**（`render` 只读它们）；`operation` / `hunks` / `hunksTruncated` 是**呈现通道**
+ * （GUI diff 卡片）的载荷，只经 `presentationMeta` 投影进会话日志，不进模型上下文，因此都是可选的
+ * ——失败值只有前四个字段，也仍然合法。
+ */
 const outputDsl = {
   type: 'object',
   additionalProperties: false,
@@ -99,6 +105,19 @@ const outputDsl = {
     ok: { type: 'boolean', required: true },
     brief: { type: 'string', required: true },
     stderr: { type: 'string', required: true },
+    operation: { type: 'string', enum: ['create', 'update'] },
+    hunks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          oldText: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+          newText: { type: 'string', required: true },
+        },
+      },
+    },
+    hunksTruncated: { type: 'boolean' },
   },
 }
 const generated = {

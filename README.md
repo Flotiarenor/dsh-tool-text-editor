@@ -98,21 +98,27 @@ Both tools **write**; neither has a preview mode.
 
 ### Return value
 
-Both tools return the same canonical value (`OUTPUT_SCHEMA`), with four fields:
+Both tools return the same canonical value (`OUTPUT_SCHEMA`). The first four fields feed the **model
+channel** (`render` reads only those); the rest is the **presentation channel** (the GUI diff card),
+projected through `output.presentationMeta` into the session log and never into the model context.
+A failure value carries the first four fields only.
 
 | Field | Content | Destination |
 |---|---|---|
-| `path` | the target path as supplied by the caller, echoed back | — |
+| `path` | the target path as supplied by the caller | canonical value only — **not** rendered |
 | `ok` | whether the write succeeded | — |
 | `brief` | one stat line (e.g. `replace@17 +1/-1`) plus any warning lines | model context |
 | `stderr` | failure reason (non-empty on failure) | model context |
+| `operation` | `create` or `update` | card title |
+| `hunks` | the applied change, one `{ oldText, newText }` per hunk with context | GUI card |
+| `hunksTruncated` | whether the card payload hit its cap | GUI card title |
 
 The model-facing text therefore has exactly two shapes:
 
 ```
-WROTE <path>            # success: stat line + warnings
+WROTE                   # success: stat line + warnings
 replace@17 +1/-1
-FAIL <path>             # failure: the complete reason (it decides the next call)
+FAIL                    # failure: the complete reason (it decides the next call)
 <reason>
 ```
 
@@ -120,7 +126,30 @@ FAIL <path>             # failure: the complete reason (it decides the next call
 echo accumulates with every call, while the caller has just sent `new_text`; `replace@17 +1/-1` already
 says which lines changed and by how much, and `read` is one call away when the content is needed. The
 model-visible bytes of a call are independent of input size (measured: a 400 KB single-line write still
-returns two lines / 90 B).
+returns two lines / 17 B).
+
+**A successful call does not echo the path either.** The result is bound to its call (`tool/result`
+carries `source.callId`) and the caller's own `file_path` argument sits in the same turn's history, so
+echoing it back adds zero information. It is not free: measured across 86 current-shape results in 79
+real session logs, one success averaged 116 B of which the `WROTE <path>` line was 55.6 B (48%); the
+path-free shape averages 66 B per success (−43%). The path still appears where it carries meaning —
+inside a failure **reason** that has to name the file — and in the GUI card (see below).
+
+### Presentation channel (GUI diff card)
+
+The tools declare `presentCall`, `output.presentationMeta` and `presentResult`:
+
+- `presentCall(args)` draws the pending card from the call's arguments (a diff for `edit_text`, a
+  create-shaped diff for `write_text`; `grep`/`lines` anchors have no old text, so they show as an
+  insertion);
+- `presentationMeta(args, value)` projects the hunks the write actually applied — the path and the real
+  change live here rather than in the model's context;
+- `presentResult(args, result)` narrows the persisted projection back into a `DiffResultView`, and
+  degrades to the raw result text whenever the projection is absent, empty or malformed.
+
+The projection is persisted in the session log, so it is capped: `PRESENT_MAX_HUNKS` (40) and
+`PRESENT_MAX_BYTES` (4096) in `lib/core.mjs`. An oversized change (a whole-file rewrite, say) keeps the
+card honest by dropping the body and marking the title `（部分 diff）`.
 
 The record of a change lives in the backup and the ledger, neither of which enters the model context:
 the pre-edit copy under `.dsh/backups/` and one JSONL line per edit in `.dsh/edits.log`.
@@ -137,7 +166,14 @@ the tools.
 - **Writes bypass `ctx.fs`.** The file is written by the plugin itself, so the fs-observation policy
   (read-before-write, version freshness), the sandbox, `sandbox_permissions` escalation and Windows
   DACL preservation are all skipped. The atomic write is implemented by the plugin (same-directory
-  temp file + fsync + rename).
+  temp file + fsync + rename). Because nothing else enforces anything on this path, the plugin mirrors
+  the session's own file policy for the one mode that forbids writing: under `read-only` both tools
+  refuse before any I/O, and the reason says the session policy — not the path — is what refused.
+  `sandboxPolicy` is consumed opportunistically (`ctx.get`), so a deployment without it, or a resolver
+  that throws, falls back to the previous behaviour instead of bricking writes.
+- **Only the `read-only` mode is mirrored.** `workspace-write` and `danger-full-access` still run
+  through the constant guard below; the plugin does not mirror the host exactly, and it is **not** a
+  security boundary — a shell command can still write anywhere the sandbox allows.
 - **Line anchors are not content-verified.** `lines` and `before` / `after <line>` locate text by line
   number alone: a wrong number does not fail, it edits somewhere else. When the anchor has to be
   verifiable, use `old_text` or `grep`.
@@ -146,15 +182,15 @@ the tools.
   other process writing the same file still can, and external changes are not detected.
 - **UTF-8 text only.** Files containing NUL bytes (binary) or invalid UTF-8 are refused, as are paths
   inside `.git/` or `.dsh/` and paths outside the workspace; the guard list is a constant, not
-  configuration.
+  configuration. (A file marked read-only by the OS is refused too — the atomic rename fails with
+  `EPERM` — and the attribute is never silently cleared.)
 - **Creating a file fills in missing parent directories.** When the `write_text` target does not exist,
   parents are created (`mkdir -p`, as the built-in `write` does). The action produces no extra output.
 - **A failed ledger append does not change the write outcome.** Once the target file is written, a
   ledger failure only appends a `[warn]` line to the result and `ok` stays true; reporting failure would
   make the caller retry a write that already landed.
-- **No diff card in the GUI.** The tools declare no `presentResult` / `presentationMeta`, so the Web UI
-  shows the same two lines the model sees. Review changes through the backup, the ledger, or the
-  project's own git diff.
+- **The card payload is capped, so a huge change shows no diff.** Past the hunk/byte caps above the
+  card body is empty and the title says `（部分 diff）`; the raw two-line result remains as the record.
 
 ## Configuration
 
@@ -174,7 +210,7 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 
 ```powershell
 # run from the root of a clone of this repository
-node tools/selftest.mjs                 # 80/80 on Windows + Node 24
+node tools/selftest.mjs                 # 105/105 on Windows + Node 24
 node tools/check-license.mjs            # license / dependency / Node-only gate
 node tools/gen-schema.mjs               # embedded schemas still match the DSL
 node tools/measure-context.mjs          # per-scenario model-visible bytes
@@ -183,7 +219,7 @@ node tools/audit-session.mjs            # reconcile against real session logs (t
 
 `npm test` chains the licence gate, the self-test and `measure-context --cap 2048`: no single call may
 put more than 2 KB of model-visible text into the context. The current worst scenario is the 1.6 KB
-ambiguity hint; a successful call is always two lines, about 90 B.
+ambiguity hint; a successful call is always two lines, 17–21 B.
 
 These live in the repository only: `tools/` is deliberately outside the `files` whitelist, so
 the published package is just the plugin, its preset installer, the docs and the license.
@@ -194,8 +230,12 @@ majority EOL inference, multi-hunk diffs, end-of-file newline changes, concurren
 parent-directory creation and errno-only failure text — **plus a plugin-layer suite** that drives
 `apply()` with a fake context and asserts tool registration, the guidance section, that every returned
 value satisfies `OUTPUT_SCHEMA`, the literal shape of the `render()` text, and the config plumbing
-(`root` / `backup` / `ledger` / `newFileBom`) — **and a return-value suite**: whatever the input size, a
-successful call is two lines and carries no change content.
+(`root` / `backup` / `ledger` / `newFileBom`) — **a return-value suite**: whatever the input size, a
+successful call is two lines, carries no change content and never repeats the path — **a presentation
+suite**: `presentCall` shapes, the applied-hunk projection, replay narrowing, the degradation paths for
+absent/empty/malformed metadata, and the card cap — and **a policy suite**: `read-only` refuses both
+tools before any I/O (no bytes, no backup), `workspace-write` / `danger-full-access` keep writing, and a
+missing or throwing policy service does not brick writes.
 
 ### Measuring context cost
 
@@ -206,9 +246,10 @@ overhead; `--vs-native` adds the same figures for the host's `write` / `edit` (S
 installation is found).
 
 `tools/audit-session.mjs` reconciles against real session logs (`<DSH_HOME>/sessions/`, multi-frame
-zstd, per call) and checks two things: whether each result matches one of the two documented text
+zstd, per call) and checks three things: whether each result matches one of the two documented text
 shapes (a diff body, a `=== ` header, an `OK ` tail, a backup name or an internal temp filename is
-reported), and whether any single result exceeds `--cap` (1024 B by default).
+reported), whether a successful result repeats the call's own `file_path` (the regression this shape
+exists to prevent), and whether any single result exceeds `--cap` (1024 B by default).
 
 `tools/gen-schema.mjs` needs an installed `@deepseek-ai/dsh-tools`: it looks for one under the dsh
 profile's `node_modules` and under the npm global prefix, and `DSH_TOOLS_ENTRY` overrides that lookup.
