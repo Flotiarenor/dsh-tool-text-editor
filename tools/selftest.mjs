@@ -320,6 +320,19 @@ async function nodeOnlySuite(ws) {
     check('a no-change edit is refused', !result.ok && /没有产生任何变化/.test(result.stderr), result.stderr)
   }
   {
+    // 新建空文件：`content: ''` 配一个不存在的目标 = 创建一个零字节文件（与原生 write 一致）。
+    // 曾经这条被当成"没有产生任何变化"拒绝，而"先建个空文件再往里写"是很常见的起手式。
+    const empty = join(ws, 'zero-byte.txt')
+    const result = await write({ file_path: 'zero-byte.txt', content: '' })
+    check('write(create) with empty content creates a zero-byte file', result.ok && existsSync(empty) && readFileSync(empty).length === 0, result.stderr || JSON.stringify(result))
+    check('write(create) with empty content reports the change', result.brief === 'write +0/-0', JSON.stringify(result.brief))
+    check('write(create) with empty content fills in missing parents',
+      (await write({ file_path: 'deep/nested/empty.txt', content: '' })).ok && existsSync(join(ws, 'deep', 'nested', 'empty.txt')))
+    const again = await write({ file_path: 'zero-byte.txt', content: '' })
+    check('write(overwrite) with empty content on an empty file is still a no-op', !again.ok && /没有产生任何变化/.test(again.stderr), again.stderr)
+  }
+
+  {
     // 新建时补齐缺失的父目录（原生 write 也这么做），且不为此多说一句
     const result = await write({ file_path: 'deep/nested/fresh.md', content: 'a\nb\n' })
     check(

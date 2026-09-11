@@ -155,7 +155,10 @@ the wrong line silently.
 
 `file_path` + `content`; creation needs no flag (missing parent directories are created), an overwrite
 is backed up first, and a brand-new file follows the **majority** line-ending style of its siblings
-(same extension first) with no BOM by default.
+(same extension first) with no BOM by default. **`content: ''` against a missing target creates a
+zero-byte file** (the stat line is `write +0/-0`; the card shows the whole file as an empty creation),
+while writing empty content over an already-empty file is still refused as "no change" — that is a real
+no-op, not a creation.
 
 Both tools **write**; neither has a preview mode.
 
