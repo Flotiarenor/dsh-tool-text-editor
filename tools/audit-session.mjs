@@ -19,11 +19,16 @@
  * 会话日志为**分帧 zstd**（边运行边追加），Node 的解压 API 只解第一帧，故此处自行按魔数切帧。
  * 零依赖，只用 `node:` 内置模块；不写入任何文件。
  *
+ * `--tools` 换一个视角：不数字节，只打印**每一轮真正下发的工具表**（`request/header` 事件里的
+ * `data.header.tools[].name`）。这是判断门禁（`lib/mask.mjs`）有没有生效的唯一标准——工具表里还有
+ * 原生 `write` / `edit` 就说明没生效，别的都是间接证据。
+ *
  * 用法：
  *   node tools/audit-session.mjs                          # 扫 ~/.dsh/sessions 下的全部会话
  *   node tools/audit-session.mjs <session.jsonl.zstd>      # 只看一个会话（给出逐调用明细）
  *   node tools/audit-session.mjs <目录> --top 8            # 每个会话列出最大的 8 条结果
  *   node tools/audit-session.mjs <文件> --cap 512 --assert
+ *   node tools/audit-session.mjs --tools                   # 每个会话的 request/header 工具表
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
@@ -32,6 +37,8 @@ import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
 const WATCHED = ['edit_text', 'write_text']
+/** 门禁要收窄掉的原生名字：它们还在工具表里，就说明门禁没生效。 */
+const NATIVE = ['write', 'edit']
 /**
  * 模型可见文本的**允许形状**：成功是 `WROTE` 加可选的一行统计与警告，失败是 `FAIL` 加原因。
  * 除此之外的一切（diff 正文、`=== ` 头、`OK ` 尾、备份名、内部临时文件名）都算泄漏——
@@ -57,6 +64,7 @@ const flagValue = (name, fallback) => {
 const TOP = Number(flagValue('--top', '3'))
 const CAP = Number(flagValue('--cap', '1024'))
 const ASSERT = hasFlag('--assert')
+const TOOLS = hasFlag('--tools')
 const bytes = (value) => Buffer.byteLength(value ?? '', 'utf8')
 
 /**
@@ -168,6 +176,29 @@ function audit(file) {
   return { perTool, rows, leaks, legacyShapes }
 }
 
+/**
+ * 每一轮真正下发的工具表。
+ *
+ * `request/header` 是宿主把这一轮的工具表写进日志的地方（工具表变了才写一条），
+ * `data.header.tools[].name` 就是模型当轮看得见的全部工具名。判断门禁是否生效看它，不看别的。
+ * @param file - 会话日志路径。
+ * @returns 每条 header 一条记录（顺序即时间顺序）。
+ */
+function toolTables(file) {
+  const tables = []
+  for (const event of readEvents(file)) {
+    if (event.type !== 'request/header') continue
+    const names = (event.data?.header?.tools ?? []).map((tool) => tool.name).sort()
+    tables.push({
+      seq: event.seq,
+      time: new Date(event.time ?? 0).toISOString().slice(11, 19),
+      reason: event.data?.reason,
+      names,
+    })
+  }
+  return tables
+}
+
 /** 目标：一个会话文件，或一棵会话目录。 */
 function collect(target) {
   const stat = statSync(target)
@@ -197,6 +228,38 @@ let leaked = 0
 let legacy = 0
 let watchedCalls = 0
 let watchedVisible = 0
+let narrowedSessions = 0
+let openSessions = 0
+
+// ── `--tools`：只打印每轮下发的工具表，不做字节对账 ─────────────────────────────
+
+if (TOOLS) {
+  for (const file of files) {
+    const tables = toolTables(file)
+    console.log(`\n=== ${file}  (${(statSync(file).size / 1024).toFixed(0)} KiB)`)
+    if (tables.length === 0) {
+      console.log('  no request/header yet')
+      continue
+    }
+    for (const [index, table] of tables.entries()) {
+      const natives = NATIVE.filter((name) => table.names.includes(name))
+      const ours = WATCHED.filter((name) => table.names.includes(name))
+      console.log(`  header #${index + 1}  seq=${table.seq}  ${table.time}  ${table.names.length} tools  reason=${table.reason ?? '-'}`)
+      console.log(`      native write/edit: ${natives.length > 0 ? `PRESENT (${natives.join(', ')})` : 'masked'}`
+        + `   our tools: ${ours.length > 0 ? ours.join(', ') : 'absent'}`)
+      if (index === tables.length - 1) console.log(`      ${table.names.join(', ')}`)
+    }
+    const last = tables.at(-1)
+    if (NATIVE.every((name) => !last.names.includes(name))) narrowedSessions += 1
+    else openSessions += 1
+  }
+  console.log('')
+  console.log(`scanned ${files.length} session log(s): the last header of ${narrowedSessions} has no native write/edit, ${openSessions} still does`)
+  console.log(openSessions === 0
+    ? 'mask check        : every session ends on a narrowed tool table'
+    : 'mask check        : sessions whose last header still lists the natives either predate the fix or run a preset without the mask row')
+  process.exit(0)
+}
 
 for (const file of files) {
   const { perTool, rows, leaks, legacyShapes } = audit(file)

@@ -201,6 +201,32 @@ function findToolFs() {
   return candidates.find((candidate) => existsSync(candidate))
 }
 
+/**
+ * `dsh-system-prompt` 的段序号表里被工具行问到的那几条（顺序只影响打印出来的 `order=` 列，
+ * 不影响本工具量的字节数；`applyReadTool` 注册时会问 `TOOL_READ`，缺了它那一行会直接抛）。
+ */
+const SECTION_ORDERS = {
+  TOOL_BASH: 1000,
+  TOOL_PWSH: 1010,
+  TOOL_READ: 1100,
+  TOOL_WRITE: 1200,
+  TOOL_EDIT: 1300,
+  TOOL_GLOB: 1400,
+  TOOL_GREP: 1500,
+}
+
+/**
+ * 渲染一个引导段：0.1.5-rc.2 起 `dsh-tool-fs` 把 `tool:read` / `tool:write` / `tool:edit` 的文本写成
+ * `({ scope }) => ctx.tools.get(name, scope) === void 0 ? '' : '…'`，所以直接 `bytes(section.text)`
+ * 量到的是函数源码而不是引导文字。
+ * @param section - 注册表交回来的段对象。
+ * @param scope - 求值用的作用域（`--vs-native` 量的是"原生工具可见"那一档）。
+ * @returns 段文本。
+ */
+function sectionText(section, scope) {
+  return typeof section.text === 'function' ? section.text({ scope }) : section.text
+}
+
 /** 原生 write / edit 的静态开销（沙箱升权字段随组合出现，这里按"有沙箱"计）。 */
 async function nativeReport() {
   const entry = findToolFs()
@@ -211,15 +237,25 @@ async function nativeReport() {
   const mod = await import(pathToFileURL(entry).href)
   const registered = []
   const sections = []
+  const scope = { kind: 'scope' }
   const sandboxCtx = {
-    tools: { register: (tool) => registered.push(tool) },
-    systemPrompt: { section: (section) => sections.push(section) },
+    // 最小壳上下文也得提供工具行真正用到的那两样：`section` 与 `getSectionOrder`（缺后者会在
+    // `applyReadTool` 里抛 "ctx.systemPrompt.getSectionOrder is not a function"），
+    // 外加一个"原生工具对这个作用域可见"的 `tools.get`，好让按可见性求值的引导段渲染出完整文本。
+    tools: {
+      register: (tool) => registered.push(tool),
+      get: (name) => (name === 'read' || name === 'write' || name === 'edit' ? { name } : undefined),
+    },
+    systemPrompt: {
+      section: (section) => sections.push(section),
+      getSectionOrder: (name) => SECTION_ORDERS[name],
+    },
     fs: { sandboxMode: 'workspace-write' },
     emit() {},
     provide() {},
     inject() {},
     get: () => ({}),
-    scope: {},
+    scope,
     effect: () => {},
   }
   ;(mod.default ?? mod).apply(sandboxCtx, { readLimit: 2000, readMaxLineLength: 2000, readMaxBytes: 262144, readStreamMinSize: 4096 })
@@ -234,8 +270,9 @@ async function nativeReport() {
   console.log(`  native write + edit schemas : ${schemaTotal} B`)
   let sectionTotal = 0
   for (const section of sections.filter((section) => section.name === 'tool:write' || section.name === 'tool:edit')) {
-    sectionTotal += bytes(section.text)
-    console.log(`  ${section.name.padEnd(8)} order=${String(section.order).padStart(4)}  ${String(bytes(section.text)).padStart(4)} B  guidance section`)
+    const text = sectionText(section, scope)
+    sectionTotal += bytes(text)
+    console.log(`  ${section.name.padEnd(8)} order=${String(section.order).padStart(4)}  ${String(bytes(text)).padStart(4)} B  guidance section`)
   }
   console.log(`  native write + edit sections: ${sectionTotal} B`)
   console.log(`  => masking both (lib/mask.mjs) removes ${schemaTotal + sectionTotal} B per request`)

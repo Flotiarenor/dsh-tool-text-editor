@@ -70,7 +70,7 @@ const tok = (value) => Math.round(value)
 
 // ── 1. 找 dsh 包 ──────────────────────────────────────────────────────────────
 
-const NEEDED = ['cordis', 'dsh-tools', 'dsh-system-prompt', 'dsh-scope', 'dsh-session-projection', 'dsh-fs-local', 'dsh-fs-sandbox', 'dsh-sandbox-policy', 'dsh-tool-fs', 'dsh-token-meter']
+const NEEDED = ['cordis', 'dsh-tools', 'dsh-system-prompt', 'dsh-scope', 'dsh-session-projection', 'dsh-fs-local', 'dsh-fs-sandbox', 'dsh-sandbox-policy', 'dsh-tool-fs', 'dsh-token-meter', 'dsh-agent']
 
 /** 与 `tools/probe-mask.mjs` 同一套布局枚举：`DSH_PACKAGES_ROOT` → profile → npm 全局前缀。 */
 function findPackages() {
@@ -98,10 +98,11 @@ if (PACKAGES === undefined) {
 }
 const pkgUrl = (name, file = 'lib/index.js') => pathToFileURL(join(PACKAGES, name, file)).href
 
-const { Context } = await import(pkgUrl('cordis'))
-const { ToolRuntime } = await import(pkgUrl('dsh-tools'))
-const { SystemPrompt, renderPrompt } = await import(pkgUrl('dsh-system-prompt'))
-const { createScope } = await import(pkgUrl('dsh-scope'))
+  const { Context } = await import(pkgUrl('cordis'))
+  const { ToolRuntime } = await import(pkgUrl('dsh-tools'))
+  const { SystemPrompt, renderPrompt } = await import(pkgUrl('dsh-system-prompt'))
+  const { createScope } = await import(pkgUrl('dsh-scope'))
+  const { AgentRegistry } = await import(pkgUrl('dsh-agent'))
 const { LocalFileSystem } = await import(pkgUrl('dsh-fs-local'))
 const toolFs = await import(pkgUrl('dsh-tool-fs'))
 const { estimateContent: hostEstimate } = await import(pkgUrl('dsh-token-meter', 'lib/types/estimate.js'))
@@ -152,6 +153,7 @@ async function mount(kind, dir, options = {}) {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(AgentRegistry)
   if (options.sandbox === true) {
     // 真实的沙箱组合：先挂策略服务，再挂**沙箱版** fs 后端（`ctx.fs` 换成它，工具层不变）。
     //
@@ -186,7 +188,7 @@ async function mount(kind, dir, options = {}) {
     })
   }
 
-  const agent = { id: `bench:${kind}`, kind: 'agent', session: { header: { cwd: dir }, events: [] } }
+  const agent = { id: `bench:${kind}`, kind: 'agent', session: { id: `bench:${kind}`, header: { cwd: dir }, events: [] } }
   const scope = createScope(host, agent, { parent: standingKey })
   agent.ctx = scope.ctx
 
@@ -194,14 +196,22 @@ async function mount(kind, dir, options = {}) {
   if (kind === 'read') agent.ctx.tools.restrict({ deny: ['write', 'edit'] })
   if (kind.includes('masked')) {
     // 屏蔽组合走**真实**的 lib/mask.mjs（它同时清掉工具与原生引导段），而不是在这里复刻它。
+    // 门禁行必须用**真实的作用域上下文**挂：它要在 `apply` 阶段把守卫注册到常驻层上，壳上下文里的
+    // `tools` 拿不到那一层（守卫会落到全局层，把别的组合一起挡住）。
     const { apply: applyMask } = await import('../lib/mask.mjs')
-    const listeners = []
     const warnings = []
-    applyMask(
-      { on: (event, listener) => listeners.push([event, listener]), logger: { warn: (message) => warnings.push(String(message)) } },
-      { mode: 'deny', ...(options.mask ?? {}) },
-    )
-    for (const [event, listener] of listeners) if (event === 'agent/created') listener({ agent })
+    await standing.ctx.plugin({
+      name: 'bench-mask',
+      inject: ['tools', 'systemPrompt'],
+      apply(c) {
+        const original = c.logger?.warn?.bind(c.logger)
+        if (original !== undefined) c.logger.warn = (message) => { warnings.push(String(message)); original(message) }
+        applyMask(c, { mode: 'deny', ...(options.mask ?? {}) })
+      },
+    })
+    // 建档事件（`agent/created`）是门禁的通路之一，所以这里让 agent 真的登记进注册表——屏蔽组合量到的
+    // 就是"收窄之后"的那张表，与线上一致。
+    ctx.agents.register(agent)
     if (warnings.length > 0) console.warn(`WARN mask: ${warnings.join(' | ')}`)
   }
 

@@ -725,49 +725,167 @@ async function policySuite() {
 /**
  * 门禁层（`lib/mask.mjs`）：把原生 `write` / `edit` 从 agent 的可见面去掉。
  *
- * 这一层用假 ctx 驱动：真正的作用域语义（同一套可见性解析器同时决定 schema、查找与派发）由
- * `tools/probe-mask.mjs` 拿真实的 `dsh-tools` + `dsh-scope` 验证，这里钉住的是本模块自己的行为——
- * 只点名看得见的名字、两种模式各自调用什么、空段与顺序、重复事件不重复注册、以及**绝不抛异常**
- * （监听器跑在 `agent/created` 的同步派发里，抛出会连带影响 agent 创建）。
+ * 这一层用假 ctx + 假注册表驱动：真实的作用域语义（同一套可见性解析器同时决定 schema、查找与派发，
+ * 以及"本层在不在这个 agent 的作用域链上"由 `tools.guardReason()` 走同一条链回答）由
+ * `tools/probe-mask.mjs`（注册表语义）与 `tools/repro-mask.mjs`（组合时序）拿真包验证。这里钉住的是
+ * 本模块自己的行为：三条通路各自在什么时候调用什么、归属判据问的是哪个问题、撤销是否成对，以及
+ * **绝不抛异常**——它既跑在 `agent/created` 的同步派发里，也可能跑在一次工具调用的守卫阶段。
+ *
+ * 假世界把"归属"建模成 `members` 集合：`guardReason()` 只对成员调用本行的守卫，这正是真注册表的
+ * `chainLayers(exec.agent)` 语义（本行的层不在链上，守卫就不会被走到）。
  */
 function maskSuite() {
-  const listeners = []
-  const ctx = { on: (event, listener) => listeners.push([event, listener]), logger: { warn: () => {} } }
-
-  /** 一个假 agent：`tools` 记录调用，`systemPrompt` 记录注册的段。 */
-  function fakeAgent(visible, opts = {}) {
-    const calls = { restrict: [], guard: [], sections: [] }
-    const tools = {
-      get: (name) => (visible.includes(name) ? { name } : undefined),
-      restrict: (filter) => calls.restrict.push(filter),
-      guard: (fn) => calls.guard.push(fn),
+  /** 搭一套假世界：监听器、行级守卫、成员集合、活 agent 列表。 */
+  function world(options = {}) {
+    const listeners = []
+    const warnings = []
+    const rowGuards = []
+    const effects = []
+    const members = new Set()
+    const live = []
+    const ask = (exec) => rowGuards.reduce((reason, fn) => reason ?? fn(exec), undefined)
+    const ctx = {
+      on: (event, listener) => listeners.push([event, listener]),
+      logger: { warn: (message) => warnings.push(String(message)) },
+      // 行级 `ctx.effect()`：真实现是"立刻跑回调、把返回的撤销函数挂在**本行**的 fiber 上"，
+      // 所以行卸载时它会跑——假世界把它捕获下来，好让"行卸载要撤销"这条能被断言到。
+      effect: (callback) => {
+        const disposer = callback()
+        effects.push(disposer)
+        return () => {}
+      },
+      tools: {
+        guard: (fn) => {
+          if (options.guardFails === true) throw new Error('registry down')
+          rowGuards.push(fn)
+        },
+        // 行级可见性查询：真实实现读的是带作用域链的注册表视图。
+        get: (name, agent) => (agent.visible.includes(name) ? { name } : undefined),
+        guardReason: (exec) => {
+          // 宿主平面安装：守卫落在**全局层**上，于是没有 agent 的探测也会被回答。
+          if (options.unscoped === true && exec.agent === undefined) return ask(exec)
+          // 别人的守卫抢答（真实实现先看全局层，再按作用域链从远到近取第一个非空答复）。
+          if (options.foreignPreempts === true) return 'foreign guard: no tool may run'
+          return members.has(exec.agent) ? ask(exec) : undefined
+        },
+      },
+      get: (name) => (name === 'agents' ? { list: () => [...live] } : undefined),
     }
-    if (opts.throwingRegistry === true) tools.restrict = () => { throw new Error('registry down') }
-    const systemPrompt = { section: (section) => calls.sections.push(section) }
-    if (opts.throwingPrompt === true) systemPrompt.section = () => { throw new Error('prompt down') }
-    return { agent: { ctx: { tools, systemPrompt } }, calls }
+    return {
+      ctx,
+      listeners,
+      warnings,
+      rowGuards,
+      effects,
+      members,
+      live,
+      events: () => listeners.map(([event]) => event),
+      emit: (event, payload) => listeners.forEach(([name, listener]) => { if (name === event) listener(payload) }),
+    }
   }
 
-  const created = (agent) => listeners.forEach(([, listener]) => listener({ agent }))
+  /**
+   * 一个假 agent：`tools` / `systemPrompt` 记录调用并交回撤销句柄（撤销计数用来验"离开组合要还原"）。
+   * @param visible - 这个 agent 看得见的工具名。
+   */
+  function fakeAgent(visible, opts = {}) {
+    const agent = { id: `agent:${visible.join('+')}`, visible: [...visible] }
+    const calls = { restrict: [], register: [], sections: [], order: [], disposed: 0 }
+    const dispose = () => { calls.disposed += 1 }
+    const tools = {
+      get: (name) => (agent.visible.includes(name) ? { name, parameters: { type: 'object', properties: {} }, execute: async () => ({ ran: name }) } : undefined),
+      restrict: (filter) => {
+        if (opts.throwingRegistry === true) throw new Error('registry down')
+        calls.restrict.push(filter)
+        calls.order.push('restrict')
+        if (opts.notify !== undefined) opts.notify()
+        return dispose
+      },
+      register: (definition) => {
+        calls.register.push(definition)
+        calls.order.push('register')
+        if (opts.notify !== undefined) opts.notify()
+        return dispose
+      },
+    }
+    const systemPrompt = {
+      section: (section) => {
+        if (opts.throwingPrompt === true) throw new Error('prompt down')
+        calls.sections.push(section)
+        if (opts.notify !== undefined) opts.notify()
+        return dispose
+      },
+    }
+    agent.ctx = { tools, systemPrompt }
+    return { agent, calls }
+  }
 
   {
-    listeners.length = 0
-    applyMask(ctx, {})
-    check(
-      'mask: subscribes to agent/created once',
-      listeners.length === 1 && listeners[0][0] === 'agent/created',
-      JSON.stringify(listeners.map(([event]) => event)),
-    )
+    const w = world()
+    applyMask(w.ctx, {})
 
-    // deny 模式：看得见的名字才点名，且只下发一次 restrict
+    check(
+      'mask: subscribes to agent/created',
+      w.events().includes('agent/created'),
+      JSON.stringify(w.events()),
+    )
+    check(
+      'mask: also subscribes to tools/change, which is what a preset switch emits',
+      w.events().includes('tools/change'),
+      JSON.stringify(w.events()),
+    )
+    check('mask: the guard is registered in apply, before any agent exists', w.rowGuards.length === 1, String(w.rowGuards.length))
+
+    // ── 守卫：最迟防线，与 agent 创建顺序无关 ──────────────────────────────────
+    const guard = w.rowGuards[0]
+    const seen = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(seen.agent)
+    w.live.push(seen.agent)
+    const reason = guard({ name: 'edit', agent: seen.agent })
+    check(
+      'mask: the guard denies a visible native with a reason that names our tools',
+      typeof reason === 'string' && /edit_text/.test(reason) && /write_text/.test(reason),
+      String(reason),
+    )
+    check(
+      'mask: the guard ignores everything that is not on the deny list',
+      guard({ name: 'edit_text', agent: seen.agent }) === undefined && guard({ name: 'read', agent: seen.agent }) === undefined,
+    )
+    check('mask: the guard ignores an exec without an agent', guard({ name: 'edit' }) === undefined)
+    const blind = fakeAgent(['read'])
+    check(
+      'mask: the guard stays out of the way when the native is invisible to that agent',
+      guard({ name: 'edit', agent: blind.agent }) === undefined,
+    )
+    check(
+      'mask: the first blocked call narrows that agent right away (next request is clean)',
+      seen.calls.restrict.length === 1
+        && JSON.stringify(seen.calls.restrict[0]) === '{"deny":["write","edit"]}'
+        && seen.calls.sections.length === 2,
+      JSON.stringify(seen.calls),
+    )
+    check('mask: a blocked call never throws out of the guard', (() => {
+      const broken = fakeAgent(['write'], { throwingRegistry: true, throwingPrompt: true })
+      w.members.add(broken.agent)
+      try {
+        void guard({ name: 'write', agent: broken.agent })
+        return true
+      } catch {
+        return false
+      }
+    })())
+
+    // ── 建档路径：创建时就加入本组合的 agent 立即收窄 ─────────────────────────
     const one = fakeAgent(['read', 'write', 'edit'])
-    created(one.agent)
+    w.members.add(one.agent)
+    w.live.push(one.agent)
+    w.emit('agent/created', { agent: one.agent })
     check(
       'mask: deny mode restricts exactly the visible native names',
       one.calls.restrict.length === 1 && JSON.stringify(one.calls.restrict[0]) === '{"deny":["write","edit"]}',
       JSON.stringify(one.calls.restrict),
     )
-    check('mask: deny mode registers no guard', one.calls.guard.length === 0, JSON.stringify(one.calls.guard))
+    check('mask: deny mode registers no per-agent guard', one.calls.register.length === 0, JSON.stringify(one.calls.register))
     check(
       'mask: the native guidance sections are shadowed with empty text',
       one.calls.sections.length === 2
@@ -776,65 +894,283 @@ function maskSuite() {
         && one.calls.sections.map((section) => section.order).join(',') === '101,102',
       JSON.stringify(one.calls.sections),
     )
+    w.emit('agent/created', { agent: one.agent })
+    check(
+      'mask: a repeated event does not register twice',
+      one.calls.restrict.length === 1 && one.calls.sections.length === 2,
+      JSON.stringify(one.calls),
+    )
 
     // 预设没挂 tool-fs：一个名字都看不见时不许调用 restrict（未知名字会抛）
     const none = fakeAgent(['read'])
-    created(none.agent)
+    w.members.add(none.agent)
+    w.emit('agent/created', { agent: none.agent })
     check(
       'mask: a preset without the natives is left alone',
       none.calls.restrict.length === 0 && none.calls.sections.length === 2,
       JSON.stringify(none.calls),
     )
 
-    // 同一个 agent 重复收到事件（或重复派发）时不重复注册：同层重名会抛
-    created(one.agent)
-    check('mask: a repeated event does not register twice', one.calls.restrict.length === 1 && one.calls.sections.length === 2, JSON.stringify(one.calls))
-
     // 注册表/提示词服务抛错时只记日志，不把 agent 创建带崩
     const broken = fakeAgent(['write'], { throwingRegistry: true, throwingPrompt: true })
+    w.members.add(broken.agent)
     let threw = false
     try {
-      created(broken.agent)
+      w.emit('agent/created', { agent: broken.agent })
     } catch {
       threw = true
     }
     check('mask: a failing registry or prompt service never throws out of the listener', threw === false)
+    check('mask: those failures are logged', w.warnings.length >= 2, JSON.stringify(w.warnings))
+
+    // ── 换 preset 路径：巡查认出成员、还原非成员 ───────────────────────────────
+    const swapped = fakeAgent(['read', 'write', 'edit'])
+    w.live.push(swapped.agent)
+    w.members.add(swapped.agent)
+    w.emit('tools/change', {})
+    check(
+      'mask: a sweep after a preset switch narrows the agent that joined',
+      swapped.calls.restrict.length === 1 && swapped.calls.sections.length === 2,
+      JSON.stringify(swapped.calls),
+    )
+    const outsider = fakeAgent(['read', 'write', 'edit'])
+    w.live.push(outsider.agent)
+    w.emit('tools/change', {})
+    check(
+      'mask: a sibling composition is left untouched by the sweep',
+      outsider.calls.restrict.length === 0 && outsider.calls.sections.length === 0,
+      JSON.stringify(outsider.calls),
+    )
+    w.emit('tools/change', {})
+    check(
+      'mask: a repeated sweep does not register twice',
+      swapped.calls.restrict.length === 1 && swapped.calls.sections.length === 2,
+      JSON.stringify(swapped.calls),
+    )
+
+    // 离开组合必须成对撤销：否则那个 agent 在新 preset 里既没有原生名、也没有本插件的名字
+    w.members.delete(swapped.agent)
+    w.emit('tools/change', {})
+    check(
+      'mask: leaving the composition lifts every registration it made',
+      swapped.calls.disposed === 3,
+      `disposed=${swapped.calls.disposed} (restrict 1 + sections 2)`,
+    )
+    w.members.add(swapped.agent)
+    w.emit('tools/change', {})
+    check(
+      'mask: rejoining the composition masks again from a clean slate',
+      swapped.calls.restrict.length === 2 && swapped.calls.disposed === 3,
+      JSON.stringify(swapped.calls.restrict.length),
+    )
+
   }
 
   {
-    // guard 模式：工具保持可见，调用被否决，原因指向我们的工具
-    listeners.length = 0
-    applyMask(ctx, { mode: 'guard' })
-    const seen = fakeAgent(['read', 'write', 'edit'])
-    created(seen.agent)
-    check('mask: guard mode registers no restriction', seen.calls.restrict.length === 0, JSON.stringify(seen.calls.restrict))
-    check('mask: guard mode registers one guard', seen.calls.guard.length === 1, JSON.stringify(seen.calls.guard.length))
-    const guard = seen.calls.guard[0]
+    // 守卫挂不上（旧版 dsh / 服务异常）时，归属判据必须退化成"不知道"：
+    // 巡查绝不能把已经收窄的 agent 悄悄放开——那比不收窄更糟（模型会重新看到原生工具，
+    // 而"看不见的坑"正是这一轮修掉的东西）。
+    const w = world({ guardFails: true })
+    applyMask(w.ctx, {})
+    const agent = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(agent.agent)
+    w.live.push(agent.agent)
+    w.emit('agent/created', { agent: agent.agent })
+    w.emit('tools/change', {})
     check(
-      'mask: the guard denies only the native names, with an actionable reason',
-      typeof guard({ name: 'edit' }) === 'string'
-        && /edit_text/.test(guard({ name: 'edit' }))
-        && /write_text/.test(guard({ name: 'write' }))
-        && guard({ name: 'edit_text' }) === undefined
-        && guard({ name: 'read' }) === undefined,
-      JSON.stringify([guard({ name: 'edit' }), guard({ name: 'edit_text' })]),
+      'mask: an unusable membership probe never lifts an existing mask',
+      agent.calls.restrict.length === 1 && agent.calls.disposed === 0,
+      JSON.stringify(agent.calls),
     )
+    check('mask: the failed guard registration is logged', w.warnings.length >= 1, JSON.stringify(w.warnings))
   }
 
   {
     // 配置：自定义名字、关掉段遮蔽
-    listeners.length = 0
-    applyMask(ctx, { deny: ['str_replace'], sections: [] })
+    const w = world()
+    applyMask(w.ctx, { deny: ['str_replace'], sections: [] })
     const custom = fakeAgent(['read', 'str_replace'])
-    created(custom.agent)
+    w.members.add(custom.agent)
+    w.live.push(custom.agent)
+    w.emit('agent/created', { agent: custom.agent })
     check(
-      'mask: deny and sections are configurable',
+      'mask: a custom deny list and disabled sections are honoured',
       JSON.stringify(custom.calls.restrict[0]) === '{"deny":["str_replace"]}' && custom.calls.sections.length === 0,
       JSON.stringify(custom.calls),
     )
   }
-}
 
+  {
+    // guard 模式：工具保持可见，调用被否决（守卫在 apply 阶段就挂）
+    const w = world()
+    applyMask(w.ctx, { mode: 'guard' })
+    const watched = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(watched.agent)
+    w.live.push(watched.agent)
+    w.emit('agent/created', { agent: watched.agent })
+    check('mask: guard mode registers no restriction', watched.calls.restrict.length === 0, JSON.stringify(watched.calls.restrict))
+    const reason = w.rowGuards[0]({ name: 'edit', agent: watched.agent })
+    check(
+      'mask: guard mode still denies, with the same actionable reason',
+      typeof reason === 'string' && /edit_text/.test(reason) && /write_text/.test(reason),
+      String(reason),
+    )
+    check(
+      'mask: guard mode keeps the tools visible, so the sweep must not restrict them',
+      watched.calls.register.length === 0 && watched.calls.sections.length === 2,
+      JSON.stringify(watched.calls),
+    )
+  }
+
+  {
+    // escape：看不见原生名字，但 native_* 回到 agent 自己的作用域；抓引用必须在 restrict 之前
+    const w = world()
+    applyMask(w.ctx, { escape: true })
+    const escaped = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(escaped.agent)
+    w.live.push(escaped.agent)
+    w.emit('agent/created', { agent: escaped.agent })
+    check(
+      'mask: escape registers native_* names after the restriction, not before',
+      escaped.calls.order.join(',') === 'restrict,register,register',
+      JSON.stringify(escaped.calls.order),
+    )
+    check(
+      'mask: the escape names mirror the native ones and keep their parameters',
+      escaped.calls.register.map((definition) => definition.name).sort().join(',') === 'native_edit,native_write'
+        && escaped.calls.register.every((definition) => definition.parameters !== undefined && typeof definition.execute === 'function'),
+      JSON.stringify(escaped.calls.register.map((definition) => definition.name)),
+    )
+    w.members.delete(escaped.agent)
+    w.emit('tools/change', {})
+    check('mask: the escape hatch is lifted together with the restriction', escaped.calls.disposed === 5, `disposed=${escaped.calls.disposed}`)
+  }
+
+  {
+    // scope: 'global'：只做守卫（挂在宿主层，所有 agent 都走到它），不做收窄
+    const w = world()
+    applyMask(w.ctx, { scope: 'global' })
+    const plain = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(plain.agent)
+    w.live.push(plain.agent)
+    w.emit('agent/created', { agent: plain.agent })
+    w.emit('tools/change', {})
+    check('mask: global scope narrows nothing', plain.calls.restrict.length === 0, JSON.stringify(plain.calls.restrict))
+    check(
+      'mask: global scope still registers the guard that denies the call',
+      w.rowGuards.length === 1 && typeof w.rowGuards[0]({ name: 'edit', agent: plain.agent }) === 'string',
+    )
+  }
+
+  {
+    // 注册动作本身会**同步**发 `tools/change`（真实注册表就是这样 notify 的）：嵌套巡查会在账还没记上
+    // 时为同一个 agent 再进来一次。没有"正在装"的牌子，同一套注册就会被装两遍——第二遍的同名段会抛。
+    const w = world()
+    applyMask(w.ctx, {})
+    const agent = fakeAgent(['read', 'write', 'edit'], { notify: () => w.emit('tools/change', {}) })
+    w.members.add(agent.agent)
+    w.live.push(agent.agent)
+    w.emit('agent/created', { agent: agent.agent })
+    check(
+      'mask: a synchronous tools/change from our own registration does not double-install',
+      agent.calls.restrict.length === 1 && agent.calls.sections.length === 2 && w.warnings.length === 0,
+      JSON.stringify([agent.calls.restrict.length, agent.calls.sections.length, w.warnings]),
+    )
+    const other = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(other.agent)
+    w.live.push(other.agent)
+    w.emit('tools/change', {})
+    check(
+      'mask: the re-entrancy gate still lets a later sweep mask another member',
+      other.calls.restrict.length === 1 && other.calls.sections.length === 2,
+      JSON.stringify(other.calls),
+    )
+  }
+
+  {
+    // 判据被别人的守卫抢答（`guardReason` 先看全局层、再取作用域链上第一个非空答复）：
+    // 那不等于"不是我的人"，所以只许"不知道"，绝不许撤销已有收窄。
+    const w = world({ foreignPreempts: true })
+    applyMask(w.ctx, {})
+    const agent = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(agent.agent)
+    w.live.push(agent.agent)
+    w.emit('agent/created', { agent: agent.agent })
+    w.emit('tools/change', {})
+    check(
+      'mask: an ambiguous membership reply never lifts an existing mask',
+      agent.calls.restrict.length === 1 && agent.calls.disposed === 0,
+      JSON.stringify(agent.calls),
+    )
+  }
+
+  {
+    // 一次失败的收窄不许被记成"已完成"：留下空账会让它永久不被重试，
+    // 而"屏蔽没做成却看不出来"正是这一轮修掉的那个 bug 的形状。
+    const w = world()
+    applyMask(w.ctx, { sections: [] })
+    const opts = { throwingRegistry: true }
+    const flaky = fakeAgent(['read', 'write', 'edit'], opts)
+    w.members.add(flaky.agent)
+    w.live.push(flaky.agent)
+    w.emit('agent/created', { agent: flaky.agent })
+    check(
+      'mask: a failed narrowing installs nothing',
+      flaky.calls.restrict.length === 0 && flaky.calls.sections.length === 0,
+      JSON.stringify(flaky.calls),
+    )
+    opts.throwingRegistry = false
+    w.emit('tools/change', {})
+    check(
+      'mask: the next sweep retries it and succeeds',
+      flaky.calls.restrict.length === 1 && flaky.calls.sections.length === 0,
+      JSON.stringify(flaky.calls),
+    )
+  }
+
+  {
+    // 那些注册挂在 **agent 的 fiber** 上，本行卸载不会带走它们：所以本行必须留一个卸载钩子。
+    const w = world()
+    applyMask(w.ctx, {})
+    const agent = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(agent.agent)
+    w.live.push(agent.agent)
+    w.emit('agent/created', { agent: agent.agent })
+    check('mask: a row-scoped unload hook is registered', w.effects.length === 1 && typeof w.effects[0] === 'function', String(w.effects.length))
+    w.effects[0]()
+    check(
+      'mask: unloading the row lifts every mask it installed',
+      agent.calls.disposed === 3,
+      `disposed=${agent.calls.disposed} (restrict 1 + sections 2)`,
+    )
+  }
+
+  {
+    // 宿主平面安装但没写 `scope: 'global'`：守卫落在**全局层**上，此时收窄会连没有本插件的 preset 一起改。
+    // 判据：没有 agent 的探测也会被回答（只有全局层上的守卫会）。
+    const w = world({ unscoped: true })
+    applyMask(w.ctx, {})
+    const agent = fakeAgent(['read', 'write', 'edit'])
+    w.members.add(agent.agent)
+    w.live.push(agent.agent)
+    w.emit('agent/created', { agent: agent.agent })
+    w.emit('tools/change', {})
+    check(
+      'mask: a host-plane row degrades to guard-only instead of narrowing every agent',
+      agent.calls.restrict.length === 0 && agent.calls.sections.length === 0,
+      JSON.stringify(agent.calls),
+    )
+    check(
+      'mask: that degradation is reported, naming the fix',
+      w.warnings.some((message) => /scope: global/.test(message)),
+      JSON.stringify(w.warnings),
+    )
+    check(
+      'mask: and the guard still refuses the call',
+      typeof w.rowGuards[0]({ name: 'edit', agent: agent.agent }) === 'string',
+    )
+  }
+}
 /**
  * 引导段的三档：`full`（默认，含"优先于原生"）、`short`（原生已被门禁屏蔽时用）、`false`（不注册）。
  */
