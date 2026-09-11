@@ -77,9 +77,12 @@ Both installs may coexist: the preset layer shadows the host layer with an ident
 
 `file_path` and `new_text` are required; give **exactly one** anchor: `old_text` (literal, copied from
 `read`), `grep` (regex; the matched line/block including its trailing newline), or `lines` (e.g.
-`"263:270"`). `mode` is `replace` (default) / `after` / `before` / `append` / `prepend`, plus `count`
-(require exactly N occurrences and replace all) and `nth` (k-th occurrence); `count` and `nth` are
-mutually exclusive.
+`"263:270"`; also including the trailing newline). `mode` is `replace` (default) / `after` / `before` /
+`append` / `prepend`, plus `count` (require exactly N occurrences and replace all) and `nth` (k-th
+occurrence); `count` and `nth` are mutually exclusive.
+
+Both anchor kinds span the line block **with** its trailing newline, so end `new_text` with a newline too —
+otherwise the replacement joins the following line and the file loses a line (the `+1/-2` stat reports it).
 
 Matching runs exact → relaxed (trailing whitespace, line-block similarity) → nearest candidates on a
 miss. A match that hits several places without `nth` / `count` refuses to write. A relaxed hit adds one

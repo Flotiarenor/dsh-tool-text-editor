@@ -74,19 +74,19 @@ const {
 
 /** `edit_text` 的作者 DSL（改这里 → 跑本脚本 → 把输出贴回 lib/editor.mjs）。 */
 const editParametersDsl = {
-  file_path: { type: 'string', required: true, description: 'Target file, resolved against the session working directory when relative.' },
+  file_path: { type: 'string', required: true, description: 'Target file; relative resolves against the session cwd.' },
   new_text: { type: 'string', required: true, description: 'Replacement / inserted text.' },
-  old_text: { type: 'string', description: 'Literal anchor text to replace (exactly one anchor source).' },
-  grep: { type: 'string', description: 'Regular-expression anchor: the matching line or line block is replaced.' },
-  lines: { type: 'string', description: 'Line anchor, e.g. "263:270" or "120".' },
-  mode: { type: 'string', enum: ['replace', 'after', 'before', 'append', 'prepend'], description: 'Edit kind. Default replace.' },
-  count: { type: 'number', description: 'Require exactly N occurrences and replace all of them.' },
-  nth: { type: 'number', description: 'Replace the k-th occurrence only (1-based).' },
+  old_text: { type: 'string', description: 'Literal anchor text (exactly one anchor source).' },
+  grep: { type: 'string', description: 'Regex anchor: the matching line block, its trailing newline included.' },
+  lines: { type: 'string', description: 'Line anchor, e.g. "263:270" or "120"; trailing newline included.' },
+  mode: { type: 'string', enum: ['replace', 'after', 'before', 'append', 'prepend'], description: 'replace (default) substitutes the anchor; after/before insert beside a grep/lines anchor; append/prepend use the file ends.' },
+  count: { type: 'number', description: 'Require exactly N matches and replace all of them.' },
+  nth: { type: 'number', description: 'Replace only the k-th match (1-based).' },
 }
 
 /** `write_text` 的作者 DSL。 */
 const writeParametersDsl = {
-  file_path: { type: 'string', required: true, description: 'Target file, resolved against the session working directory when relative.' },
+  file_path: { type: 'string', required: true, description: 'Target file; relative resolves against the session cwd.' },
   content: { type: 'string', required: true, description: 'Complete new file content.' },
 }
 
