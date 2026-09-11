@@ -152,6 +152,7 @@ const PUBLIC = [
   ...SOURCES,
   'README.md',
   'README.zh.md',
+  'HANDOVER.md',
   'package.json',
   'LICENSE',
   '.gitattributes',
@@ -317,7 +318,7 @@ console.log('── publishing hygiene ──')
     ['斜杠后紧跟加粗', /[^\s]\*\*(?=[A-Za-z])/],
   ]
   const offenders = []
-  for (const rel of ['README.md', 'README.zh.md']) {
+  for (const rel of ['README.md', 'README.zh.md', 'HANDOVER.md']) {
     read(rel).split('\n').forEach((line, index) => {
       for (const [label, pattern] of RULES) {
         if (pattern.test(line)) offenders.push(`${rel}:${index + 1} ${label} → ${line.trim().slice(0, 70)}`)
