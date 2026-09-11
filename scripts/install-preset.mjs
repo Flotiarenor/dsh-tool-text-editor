@@ -14,15 +14,20 @@
  *
  * 用法：
  *   node scripts/install-preset.mjs                      # 默认 --id texteditor --base standard
- *   node scripts/install-preset.mjs --id my-edit --base code
+ *   node scripts/install-preset.mjs --id my-edit --base minimal
  *   node scripts/install-preset.mjs --from <path-to-agent.cordis.yml>   # 自己指定源组合
  *   node scripts/install-preset.mjs --force              # 覆盖已存在的 preset（只覆盖两个文件）
  *   node scripts/install-preset.mjs --dry-run            # 只打印会做什么，不落盘
  *   node scripts/install-preset.mjs --mask-native        # 额外插入屏蔽原生 write/edit 的门禁行
+ *   node scripts/install-preset.mjs --mask-native --escape   # 门禁 + native_edit/native_write 逃生口
  *
  * `--mask-native` 会多插一行 `tool-native-edit-mask`（`lib/mask.mjs`），并给编辑行写
  * `guidance: short`：这个 preset 的会话里，原生 `write`/`edit` 既不出现在工具表里也调不动，
- * 两段原生引导也被空段遮蔽（合计约 2.4 KB/请求）。其它 preset 的会话不受影响，可作对照组。
+ * 两段原生引导也被空段遮蔽（原生那一对约 2.4 KB/请求不再下发）。其它 preset 的会话不受影响，可作对照组。
+ * 净账（含本插件自己的两个 schema）用 `node tools/bench-tokens.mjs` 量。
+ *
+ * `--escape` 给门禁行加 `escape: true`：原生名字仍不可见，但执行体以 `native_edit`/`native_write`
+ * 回到该 agent 的作用域，便于随时对照原生行为；代价是两张 schema 重新下发（实测约 493 token/请求）。
  *
  * 退出码：0 成功，1 失败，2 用法错误 / 找不到 dsh 自带的 preset 组合。
  */
@@ -37,7 +42,17 @@ const REPO = resolve(HERE, '..')
 const PLUGIN = join(REPO, 'lib', 'editor.mjs').replace(/\\/g, '/')
 const MASK = join(REPO, 'lib', 'mask.mjs').replace(/\\/g, '/')
 const META = join(REPO, 'preset', 'preset.yml')
-const SHIPPED_PRESET_DIR = ['config', 'agent-presets']
+/**
+ * dsh 自带 preset 组合在 `node_modules` 里的布局，按版本从上到下试：
+ *   * `@deepseek-ai/dsh/config/agent-presets/<base>/` —— ≤ 0.1.0-rc.6 的布局（本脚本最初就是照它写的）；
+ *   * `@deepseek-ai/dsh-agent-presets/presets/<base>/` —— 0.1.5-rc.2 起自带组合搬进了**另一个包**
+ *     （该包用 `SHIPPED_PRESET_ROOT = new URL('../presets/', import.meta.url)` 自己定位），
+ *     旧路径 `@deepseek-ai/dsh/config` 在新版里已经不存在。
+ */
+const SHIPPED_LAYOUTS = [
+  ['dsh', 'config', 'agent-presets'],
+  ['dsh-agent-presets', 'presets'],
+]
 const COMPOSITION = 'agent.cordis.yml'
 
 function flagValue(name) {
@@ -66,7 +81,9 @@ function findCompositions(base) {
   if (typeof explicit === 'string' && explicit !== '') candidates.push(resolve(explicit))
   const add = (nodeModules) => {
     if (typeof nodeModules !== 'string' || nodeModules === '') return
-    candidates.push(join(nodeModules, '@deepseek-ai', 'dsh', ...SHIPPED_PRESET_DIR, base, COMPOSITION))
+    for (const layout of SHIPPED_LAYOUTS) {
+      candidates.push(join(nodeModules, '@deepseek-ai', ...layout, base, COMPOSITION))
+    }
   }
   add(join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'profiles', 'node_modules'))
   const globalRoots = process.platform === 'win32'
@@ -80,8 +97,9 @@ function findCompositions(base) {
  * 我们插进组合里的那一段（只有这一段是我们自己的文字 + 行）。
  * @param sourcePath - 源组合路径（写进注释，便于升级后重跑）。
  * @param maskNative - 是否同时插入"屏蔽原生 write/edit"的门禁行，并让编辑行改用短引导。
+ * @param escape - 门禁行是否带 `escape: true`（原生执行体以 `native_edit` / `native_write` 保留）。
  */
-function pluginBlock(sourcePath, maskNative) {
+function pluginBlock(sourcePath, maskNative, escape = false) {
   const editorTail = [
     '# 可选 config（插件没有 Config schema，字段原样透传）：',
     '#   backup / ledger: boolean   默认都 true（备份到 artifactsDir/backups，台账 artifactsDir/edits.log）',
@@ -116,8 +134,17 @@ function pluginBlock(sourcePath, maskNative) {
       '# 的钱照付）；`sections: []` 则保留原生那两段引导文字。',
       '#',
       '# 回退：删掉这一行（或给编辑行加 `guidance: full` 恢复原引导段）。',
+      ...(escape
+        ? [
+          '#',
+          '# `escape: true`：原生**名字**仍然看不见（直呼 `edit` / `write` 得到 UNKNOWN_TOOL），但执行体以',
+          '# `native_edit` / `native_write` 回到本 agent 自己的作用域 —— 想对照或观察原生行为时不必换会话。',
+          '# 代价是这两张 schema 重新下发（实测约 1.9 KB ≈ 493 token/请求，见 `node tools/bench-tokens.mjs`）。',
+        ]
+        : []),
       '- id: tool-native-edit-mask',
       `  name: '${MASK}'`,
+      ...(escape ? ['  config:', '    escape: true'] : []),
       '',
     ]
     : []
@@ -168,11 +195,11 @@ const ANCHORS = [
  * @returns `{ text, anchor }`
  * @throws {Error} 源组合看起来已经打过补丁时。
  */
-function inject(source, sourcePath, maskNative) {
+function inject(source, sourcePath, maskNative, escape) {
   if (/^- id: tool-text-editor$/m.test(source)) {
     throw new Error('源组合里已经有 tool-text-editor 行了 —— 请指向 dsh 自带的原始组合')
   }
-  const block = pluginBlock(sourcePath, maskNative)
+  const block = pluginBlock(sourcePath, maskNative, escape)
   for (const { pattern, label } of ANCHORS) {
     const match = pattern.exec(source)
     if (match !== null) {
@@ -191,6 +218,7 @@ const base = flagValue('--base') ?? 'standard'
 const force = process.argv.includes('--force')
 const dryRun = process.argv.includes('--dry-run')
 const maskNative = process.argv.includes('--mask-native')
+const escape = process.argv.includes('--escape')
 const fromFlag = flagValue('--from')
 
 if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
@@ -198,7 +226,11 @@ if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
   process.exit(2)
 }
 if (!/^[a-z0-9][a-z0-9-]*$/.test(base)) {
-  console.error('FAIL --base 必须是 dsh 自带 preset 的 id（如 standard / code / minimal），收到：' + base)
+  console.error('FAIL --base 必须是 dsh 自带 preset 的 id（如 standard / minimal / cordis / ptc），收到：' + base)
+  process.exit(2)
+}
+if (escape && !maskNative) {
+  console.error('FAIL --escape 只对 --mask-native 有意义（它加在门禁行上）。')
   process.exit(2)
 }
 if (!existsSync(PLUGIN)) {
@@ -226,10 +258,27 @@ if (sourcePath === undefined) {
 const source = readFileSync(sourcePath, 'utf8')
 let injected
 try {
-  injected = inject(source, sourcePath, maskNative)
+  injected = inject(source, sourcePath, maskNative, escape)
 } catch (error) {
   console.error('FAIL ' + error.message)
   process.exit(2)
+}
+
+/**
+ * 写出去的 `preset.yml` 要跟**实际组合**一致。
+ *
+ * `preset/preset.yml` 是仓库里那份与模式无关的文字，而这一行状态是随 `--mask-native` / `--escape`
+ * 变的：旧版脚本原样拷贝，于是开着门禁的 preset 描述里也一直写着"原生 edit/write 保持不变"。
+ * @returns 补上状态句的元数据文本。
+ */
+function metadataText() {
+  const head = readFileSync(META, 'utf8').trimEnd()
+  const tail = maskNative
+    ? (escape
+      ? '；原生 `edit`/`write` 已被门禁行按 agent 作用域屏蔽，执行体以 `native_edit`/`native_write` 保留（`escape: true`）。'
+      : '；原生 `edit`/`write` 已被门禁行按 agent 作用域屏蔽：既不出现在工具表里，也调不动。')
+    : '；原生 edit/write 保持不变。'
+  return head + tail + '\n'
 }
 
 const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
@@ -241,7 +290,7 @@ const targetMeta = join(targetDir, 'preset.yml')
 
 console.log('仓库        : ' + REPO)
 console.log('插件        : ' + PLUGIN)
-if (maskNative) console.log('门禁        : ' + MASK + '（屏蔽原生 write/edit，编辑行 guidance: short）')
+if (maskNative) console.log('门禁        : ' + MASK + `（屏蔽原生 write/edit${escape ? ' + native_edit/native_write 逃生口' : ''}，编辑行 guidance: short）`)
 console.log('源组合      : ' + sourcePath + (fromFlag === undefined && process.env.DSH_PRESET_SOURCE === undefined ? `（--base ${base}）` : ''))
 console.log('插入位置    : ' + injected.anchor)
 console.log('DSH_HOME    : ' + dshHome)
@@ -275,7 +324,7 @@ if (exists) {
 
 mkdirSync(targetDir, { recursive: true })
 writeFileSync(targetComposition, injected.text, 'utf8')
-writeFileSync(targetMeta, readFileSync(META, 'utf8'), 'utf8')
+writeFileSync(targetMeta, metadataText(), 'utf8')
 
 console.log('')
 console.log('OK 已安装 preset "' + id + '"')

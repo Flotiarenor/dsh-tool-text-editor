@@ -28,8 +28,12 @@ build step, no third-party package.
 | Node | **The only dependency** — no interpreter, no external runtime, no process-startup cost per call. |
 
 The package installs nothing of its own. Its single `peerDependencies` entry, `@deepseek-ai/dsh-tools`,
-is the host contract — "needs this dsh or newer" — and resolves from the dsh installation rather than
-being installed beside the plugin.
+is the host contract — "needs this dsh, and not a later major line" — and resolves from the dsh
+installation rather than being installed beside the plugin. The range is
+`>=0.1.0-rc.6 || >=0.1.5-rc.2`, verified end to end against both `0.1.0-rc.6` and `0.1.5-rc.2`: the
+two clauses exist because npm's prerelease rule only admits a prerelease whose `major.minor.patch`
+tuple carries a prerelease comparator of its own, so one clause per verified line is what keeps a
+prerelease install from reading as an unmet peer.
 
 ## Install
 
@@ -296,6 +300,9 @@ ambiguity hint; a successful call is always two lines, 17–21 B.
 
 These live in the repository only: `tools/` is deliberately outside the `files` whitelist, so
 the published package is just the plugin, its preset installer, the docs and the license.
+`HANDOVER.md` is the internal dev handover (state, evidence, open work, operational steps); it is
+not published either, and `tools/check-license.mjs` keeps it under the same line-ending and
+CJK-spacing rules as the two READMEs.
 
 `tools/selftest.mjs` covers BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, relaxed
 matching reports, usage errors, binary/invalid-UTF-8 refusal, editable `.dsh/` and outside-workspace
@@ -354,6 +361,8 @@ tools/check-license.mjs  # license / dependency / Node-only hygiene gate
 tools/gen-schema.mjs     # authoritative source and checker for the embedded JSON Schemas
 tools/measure-context.mjs  # per-scenario model-visible bytes + the native-tool comparison
 tools/audit-session.mjs  # reconciliation against real session logs + text-shape check
+tools/bench-tokens.mjs   # token-cost benchmark vs the built-in write/edit (static, scenarios, real logs)
+HANDOVER.md              # internal dev handover: findings, evidence, open work, operations
 ```
 
 Backups and the ledger use fixed, documented names and fields: one file per edit under
