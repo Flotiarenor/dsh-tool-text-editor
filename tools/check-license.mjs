@@ -119,6 +119,18 @@ for (const field of ['dependencies', 'optionalDependencies', 'bundledDependencie
 }
 check('engines.node is declared', typeof pkg.engines?.node === 'string', JSON.stringify(pkg.engines))
 {
+  // 装出去的包必须"够用"：lib 是 patch/preset 行加载的模块；scripts + preset 是 preset 安装路径要读的
+  // 两个文件；cordis.patch.yml 是 dsh.bundle.patch 的目标；LICENSE/README 是发布合规与文档。
+  const REQUIRED = ['lib', 'preset', 'scripts', 'cordis.patch.yml', 'README.md', 'LICENSE']
+  const missing = REQUIRED.filter((entry) => !(pkg.files ?? []).includes(entry))
+  check('the package ships everything the install paths need', missing.length === 0, `files 里缺少：${JSON.stringify(missing)}`)
+}
+{
+  // 开发工具（自测 + 两个门禁）刻意只留在仓库里：它们不是运行时依赖，用户装完也用不到。
+  const forbidden = ['tools'].filter((entry) => (pkg.files ?? []).includes(entry))
+  check('the dev tooling stays out of the published package', forbidden.length === 0, `files 里不该有：${JSON.stringify(forbidden)}`)
+}
+{
   const missing = (pkg.files ?? []).filter((entry) => !existsSync(join(REPO, entry)))
   check('every path in files exists', missing.length === 0, `不存在：${JSON.stringify(missing)}`)
 }

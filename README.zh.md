@@ -136,6 +136,9 @@ node tools/check-license.mjs   # 许可证 / 依赖 / 纯 Node 门禁
 node tools/gen-schema.mjs      # 内嵌 schema 是否仍与作者 DSL 一致
 ```
 
+这三个门禁只留在仓库里：`tools/` 刻意不在 `files` 白名单内，所以发布出去的包只有插件本体、preset
+安装器、文档与许可证。
+
 `tools/selftest.mjs` 覆盖：BOM/行尾保真、`dry_run`、四种锚点、`count`、歧义拒写、用法错误、
 二进制/非法 UTF-8、护栏（`.dsh/`、工作区之外）、多数派行尾、多 hunk、末尾换行差异、并发写不撕裂；
 **外加一层插件层断言** —— 用假 ctx 驱动 `apply()`，断言工具注册、引导段身份、每个返回值都满足
@@ -167,7 +170,7 @@ tools/gen-schema.mjs     # 内嵌 schema 的权威来源与校验器
 1. 移除 `package.json` 的 `private: true`（`publishConfig.access: public` 已经写好 —— scoped 包默认不是公开的）；
 2. 让 `engines.node` 与 `@deepseek-ai/dsh-tools` 的 peer 区间都跟上你要支持的 dsh 版本 —— 那条 peer 区间
    才是插件清单与市场类工具读取的"兼容性声明"；
-3. 先 `pnpm pack` 看一眼 tarball：`files` 白名单应产出 `LICENSE` + `lib` + `preset` + `cordis.patch.yml` + 两份 README，不多不少；
+3. 先 `pnpm pack` 看一眼 tarball：应当只有 `LICENSE` + `lib` + `preset` + `scripts` + `cordis.patch.yml` + 两份 README（加上 `package.json` 共 9 个文件），尤其**不含** `tools/`；
 4. 在工作区干净的状态下显式指定官方源发布：`pnpm publish --registry https://registry.npmjs.org`；
    `prepublishOnly` 会先跑许可证门禁与自测。像 npmmirror 这样的镜像**不能**接收发布；
 5. 给 `package.json` 里的版本打 tag（`v<version>`）。

@@ -129,6 +129,9 @@ node tools/check-license.mjs   # license / dependency / Node-only gate
 node tools/gen-schema.mjs      # embedded schemas still match the DSL
 ```
 
+These three live in the repository only: `tools/` is deliberately outside the `files` whitelist, so
+the published package is just the plugin, its preset installer, the docs and the license.
+
 `tools/selftest.mjs` covers BOM/EOL fidelity, `dry_run`, all four anchor kinds, `count`, ambiguity
 refusal, usage errors, binary/invalid-UTF-8 refusal, `.dsh/` and outside-workspace guards, majority
 EOL inference, multi-hunk diffs, end-of-file newline changes and concurrent writes — **plus a
@@ -165,8 +168,9 @@ Backups and the ledger use fixed, documented names and fields: one file per edit
 2. Keep `engines.node` and the `@deepseek-ai/dsh-tools` peer range in step with the dsh release you
    target — the peer range is what plugin inventory and market tooling read as your compatibility
    statement.
-3. Preview the tarball with `pnpm pack`: the `files` whitelist should yield `LICENSE` + `lib` +
-   `preset` + `cordis.patch.yml` + both READMEs, and nothing else.
+3. Preview the tarball with `pnpm pack`: it should hold `LICENSE` + `lib` + `preset` + `scripts` +
+   `cordis.patch.yml` + both READMEs (nine files with `package.json`) and nothing else — in
+   particular no `tools/`.
 4. From a clean working tree, publish against npmjs explicitly:
    `pnpm publish --registry https://registry.npmjs.org`. `prepublishOnly` runs the license gate and
    the self-test first; a mirror such as npmmirror cannot accept publishes.
