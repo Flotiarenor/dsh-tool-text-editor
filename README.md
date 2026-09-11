@@ -45,14 +45,8 @@ node scripts/install-preset.mjs
 #        / --force / --dry-run / --from <agent.cordis.yml path>
 ```
 
-The installer takes the preset composition **shipped with your own dsh installation**
-(`config/agent-presets/standard/agent.cordis.yml`; choose another with `--base`, or point at any file
-with `--from` / `DSH_PRESET_SOURCE`), splices in the `tool-text-editor` row pointing at this
-checkout's `lib/editor.mjs`, and writes `<DSH_HOME>\.agent-presets\texteditor\` (`DSH_HOME` defaults
-to `~/.dsh`). **Restart `dsh web`, then start a new session on preset `texteditor`.**
-
-Nothing of dsh's own composition is copied into this repository, so the preset also tracks the dsh
-version you have installed — re-run with `--force` after upgrading dsh.
+Then restart `dsh web` and start a new session on preset `texteditor`; a preset is a session-creation
+fact, so a running session cannot switch to it.
 
 ### Option 2 — install into the profile (available to every session)
 
@@ -80,30 +74,40 @@ Both installs may coexist: the preset layer shadows the host layer with an ident
 
 ## Tools
 
-**`edit_text`** — targeted replacement. `file_path` and `new_text` are required; give **exactly one**
-anchor: `old_text` (literal), `grep` (regex; the matched line/block including its trailing newline),
-or `lines` (e.g. `"263:270"`). `mode` is `replace` (default) / `after` / `before` / `append` /
-`prepend`; also `count` (require exactly N occurrences and replace all), `nth` (k-th occurrence),
-`strict`, `dry_run`, `note`. `count` and `nth` are mutually exclusive.
+### `edit_text` — targeted replacement
 
-**`write_text`** — create or fully replace a file: `file_path` + `content`; creation needs no flag,
-an overwrite is backed up first, and a brand-new file follows the **majority** line-ending style of
-its siblings (same extension first) with no BOM by default.
+`file_path` and `new_text` are required; give **exactly one** anchor: `old_text` (literal, copied from
+`read`), `grep` (regex; the matched line/block including its trailing newline), or `lines` (e.g.
+`"263:270"`). `mode` is `replace` (default) / `after` / `before` / `append` / `prepend`; also `count`
+(require exactly N occurrences and replace all), `nth` (k-th occurrence), `strict`, `dry_run`, `note`.
+`count` and `nth` are mutually exclusive.
+
+### `write_text` — create or fully replace a file
+
+`file_path` + `content`; creation needs no flag, an overwrite is backed up first, and a brand-new file
+follows the **majority** line-ending style of its siblings (same extension first) with no BOM by
+default.
 
 Both **write by default** (like the built-ins); pass `dry_run: true` to preview. The returned text
 always includes the diff.
 
 ## Deliberate limitations
 
-- Writing bypasses `ctx.fs`: no fs-observation policy (read-before-write / version freshness), no
-  sandbox or `sandbox_permissions` escalation, no Windows DACL preservation.
-- `lines` / `before <line>` are **blind anchors**: a wrong line number never fails, it edits the
-  wrong place. Prefer `old_text` / `grep`.
-- Per-target serialization covers **this process only**: parallel tool calls cannot overwrite each
-  other (in-process queue plus an atomic write), but another dsh instance or your editor still can,
-  and external changes are not detected.
-- Binary content (NUL) and invalid UTF-8 are refused; `.git/`, `.dsh/`, and any path outside the
-  workspace are refused.
+These are design choices, not defects to be fixed; check them against your use case before relying on
+the tools.
+
+- **Writes bypass `ctx.fs`.** The file is written by the plugin itself, so the fs-observation policy
+  (read-before-write, version freshness), the sandbox, `sandbox_permissions` escalation and Windows
+  DACL preservation are all skipped — and the Web UI therefore shows no diff card (the model still
+  receives the textual diff).
+- **Line anchors are not content-verified.** `lines` and `before` / `after <line>` locate text by line
+  number alone: a wrong number does not fail, it edits somewhere else. When the anchor has to be
+  verifiable, use `old_text` or `grep`.
+- **Per-target serialization is per process.** An in-process queue per target plus an atomic write
+  keeps parallel tool calls from overwriting each other, but another dsh instance, an editor or any
+  other process writing the same file still can, and external changes are not detected.
+- **UTF-8 text only.** Files containing NUL bytes (binary) or invalid UTF-8 are refused, as are paths
+  inside `.git/` or `.dsh/` and paths outside the workspace.
 
 ## Configuration
 
@@ -160,21 +164,6 @@ Backups and the ledger use fixed, documented names and fields: one file per edit
 `.dsh/backups/`, named `<flattened-absolute-path>@<timestamp>`, and one JSON object per line in
 `.dsh/edits.log` (`time`, `id`, `tool`, `file`, `abspath`, `action`, `kinds`, `line_start`,
 `line_end`, `added`, `removed`, `bom`, `eol`, `backup`, `summary`).
-
-## Publishing checklist
-
-1. Drop `private: true` from `package.json` (`publishConfig.access: public` is already set — a scope
-   is not public by default).
-2. Keep `engines.node` and the `@deepseek-ai/dsh-tools` peer range in step with the dsh release you
-   target — the peer range is what plugin inventory and market tooling read as your compatibility
-   statement.
-3. Preview the tarball with `pnpm pack`: it should hold `LICENSE` + `lib` + `preset` + `scripts` +
-   `cordis.patch.yml` + both READMEs (nine files with `package.json`) and nothing else — in
-   particular no `tools/`.
-4. From a clean working tree, publish against npmjs explicitly:
-   `pnpm publish --registry https://registry.npmjs.org`. `prepublishOnly` runs the license gate and
-   the self-test first; a mirror such as npmmirror cannot accept publishes.
-5. Tag `v<version>` to match `package.json`.
 
 ## License
 
