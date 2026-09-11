@@ -1,4 +1,4 @@
 # SPDX-FileCopyrightText: 2026 Flotiarenor
 # SPDX-License-Identifier: Apache-2.0
 name: 字节保真编辑器（BOM/CRLF）
-description: standard 的副本，额外挂载 edit_text / write_text 两个文本编辑工具：保 UTF-8 BOM 与文件自身 CRLF/LF 风格、出 unified diff、落盘前备份、支持 grep/lines 锚点。纯 Node 进程内实现（零依赖、不启动任何外部进程）；原生 edit/write 保持不变。
+description: standard 的副本，额外挂载 edit_text / write_text 两个文本编辑工具：保 UTF-8 BOM 与文件自身 CRLF/LF 风格、宽松匹配（精确失败时按行块相似度回退）、落盘前备份、支持 grep/lines 锚点；结果只回一行统计，不回显改动内容。纯 Node 进程内实现（零依赖、不启动任何外部进程）；原生 edit/write 保持不变。

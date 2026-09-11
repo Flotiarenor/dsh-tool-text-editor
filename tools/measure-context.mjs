@@ -7,10 +7,11 @@
  * `lib/editor.mjs` 的 `apply()` 挂到模拟 ctx 上，走真实的 `execute()` → `output.render()` 路径
  * （宿主即如此调用），逐场景输出：
  *
- *   入参字节 | 模型可见字节 | 倍率 | presentationMeta 字节 | 行数
+ *   入参字节 | 模型可见字节 | 倍率 | 行数
  *
- * 场景集包含行数预算无法约束的一类（压缩为单行的大文件、宽数据行、替换一行超长文本），以及失败
- * 路径（歧义 / 目录目标 / 补齐父目录）；这些场景此前会使整篇内容进入模型上下文。
+ * 契约是"模型可见文本与输入规模无关"：成功路径固定为 `WROTE <路径>` 加一行统计，因此场景集特意
+ * 覆盖大文件、压缩为单行的大文件、宽数据行、超长单行的替换，以及失败路径（歧义 / 目录目标 /
+ * 补齐父目录）。
  *
  * 仅在临时目录中作业，不修改仓库文件。零依赖，只用 `node:` 内置模块。
  *
@@ -65,7 +66,6 @@ async function probe(label, toolName, args, config) {
     argBytes,
     visibleBytes: bytes(visible),
     ratio: argBytes === 0 ? 0 : bytes(visible) / argBytes,
-    metaBytes: bytes(JSON.stringify(tool.output.presentationMeta(args, value))),
     lines: visible === '' ? 0 : visible.split('\n').length,
     firstLine: visible.split('\n')[0].slice(0, 44).replace(/\s+/g, ' '),
   }
@@ -73,33 +73,37 @@ async function probe(label, toolName, args, config) {
 
 const long = (n) => 'x'.repeat(n)
 
-/** 场景表：每个函数拿到工作区，返回探针结果。 */
+/** 场景表：每个函数拿到工作区，返回探针入参。 */
 const SCENARIOS = [
-  ['45-line new file (above the line budget)', 'write_text', (ws) => ({
+  ['write: 45 lines', 'write_text', (ws) => ({
     __ws: ws,
     file_path: join(ws, 'big.txt'),
     content: Array.from({ length: 45 }, (_, i) => `row ${String(i + 1).padStart(3, '0')} | payload alpha-${String(i + 1).padStart(4, '0')} | filler`).join('\n') + '\n',
   })],
-  ['200-line rewrite, diff:"full"', 'write_text', (ws) => ({
+  ['write: 200-line rewrite', 'write_text', (ws) => ({
     __ws: ws,
     file_path: join(ws, 'full.txt'),
     content: Array.from({ length: 200 }, (_, i) => `line ${i} ${'y'.repeat(60)}`).join('\n') + '\n',
-    diff: 'full',
   })],
-  ['12-line new file (fits the budget)', 'write_text', (ws) => ({
+  ['write: 12-line new file', 'write_text', (ws) => ({
     __ws: ws,
     file_path: join(ws, 'small.txt'),
     content: Array.from({ length: 12 }, (_, i) => `key${i} = ${i}`).join('\n') + '\n',
   })],
-  ['single 200 KB line (minified)', 'write_text', (ws) => ({
+  ['write: single 200 KB line (minified)', 'write_text', (ws) => ({
     __ws: ws,
     file_path: join(ws, 'min.js'),
     content: 'const a=' + long(200_000) + ';\n',
   })],
-  ['20 lines x 5 KB = 100 KB', 'write_text', (ws) => ({
+  ['write: 20 lines x 5 KB = 100 KB', 'write_text', (ws) => ({
     __ws: ws,
     file_path: join(ws, 'wide.txt'),
     content: Array.from({ length: 20 }, (_, i) => `L${i} ${long(4990)}`).join('\n') + '\n',
+  })],
+  ['write: 400 KB single line', 'write_text', (ws) => ({
+    __ws: ws,
+    file_path: join(ws, 'huge.txt'),
+    content: long(400_000) + '\n',
   })],
   ['edit: swap one 200 KB line', 'edit_text', (ws) => ({
     __ws: ws,
@@ -227,13 +231,12 @@ for (const [label, toolName, build] of SCENARIOS) {
   rows.push(await probe(label, toolName, build(ws)))
 }
 
-console.log('scenario                                    tool        args   visible   ratio    meta  lines  result')
+console.log('scenario                                   tool        args   visible   ratio  lines  result')
 for (const row of rows) {
   console.log(
-    row.label.padEnd(42) + '  ' + row.tool.padEnd(10)
+    row.label.padEnd(41) + '  ' + row.tool.padEnd(10)
     + String(row.argBytes).padStart(7) + ' ' + String(row.visibleBytes).padStart(8)
-    + '  ' + row.ratio.toFixed(2).padStart(5) + 'x' + String(row.metaBytes).padStart(7)
-    + String(row.lines).padStart(6) + '  ' + row.firstLine,
+    + '  ' + row.ratio.toFixed(3).padStart(5) + 'x' + String(row.lines).padStart(6) + '  ' + row.firstLine,
   )
 }
 

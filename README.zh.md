@@ -5,20 +5,16 @@
 [DeepSeek Harness](https://github.com/deepseek-ai)（dsh）的模型工具插件，提供两个**字节保真**的
 文本编辑工具：`edit_text` 与 `write_text`。
 
-原生工具在 Windows 上存在两处缺陷：
+它只解决原生 `write` / `edit`（由 `@deepseek-ai/dsh-fs-local` 实现）做不到的三件事：
 
-| 场景（文件为 UTF-8 **BOM + CRLF**） | 原生 `edit`                  | 原生 `write`                       | 本插件            |
-| ---------------------------------------- | ----------------------------- | ----------------------------------- | ----------------- |
-| 改一行                                   | CRLF 保住 / **BOM 丢失** | —                                  | BOM + CRLF 都保住 |
-| 整篇覆盖                                 | —                            | **BOM 丢失 + CRLF 被拍成 LF** | BOM + CRLF 都保住 |
+| 缺陷 | 成因 | 本插件 |
+| ---- | ---- | ------ |
+| 改一行或整篇覆盖都**丢 UTF-8 BOM** | 该实现没有 BOM 处理；Node 的 `TextDecoder` 默认吞掉前导 BOM 字节 | BOM 保住 |
+| 整篇覆盖把 **CRLF 拍成 LF** | `writeText` 不按原文件风格还原行尾 | 行尾跟随文件 |
+| `old_string` 差一个空格即报 **`FS_EDIT_NOT_FOUND`** | 原生 `edit` 只做精确匹配，没有回退 | 精确 → 宽松 → 最接近候选（歧义时拒绝写盘） |
 
-原因在于 `@deepseek-ai/dsh-fs-local` 完全没有 BOM 处理（Node 的 `TextDecoder` 默认吞掉前导
-BOM 字节），且 `writeText` 不按原文件风格还原行尾。
-
-在保真之外，本插件还提供：**统一 diff**（可用 dry-run 预览）、**写入前自动备份**、**编辑台账**、
-**`grep` / `lines` 锚点**（无需人工誊抄原文）、**歧义时拒绝写入**，以及**最接近候选**提示。
-
-两个工具的规范返回值、模型可见文本的构成与 UI 卡片的投影方式见「返回值」。
+在此之外提供**写入前自动备份**、**编辑台账**、**`grep` / `lines` 锚点**（无需人工誊抄原文）与
+**最接近候选**提示。返回值与模型可见文本的构成见「返回值」。
 
 ## 实现与依赖
 
@@ -81,62 +77,47 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | `mode`      | -    | `replace`（默认）/ `after` / `before` / `append` / `prepend`。 |
 | `count`     | -    | 要求恰好 N 处命中并全部替换（不符则拒绝写入）。                |
 | `nth`       | -    | 只替换第 k 处（1-based）。                                               |
-| `strict`    | -    | 禁用宽松匹配（只接受精确匹配）。                                         |
-| `diff`      | -    | 结果里 diff 正文的详细程度：`auto`（默认，改动小时才给）/ `full`（总给，仍封顶）/ `none`（不给）。 |
-| `dry_run`   | -    | 只输出 diff，不写入文件。                                                |
-| `note`      | -    | 一行说明，记入编辑台账。                                                 |
 
 `old_text` / `grep` / `lines` **必须且只能提供一个**；`append` / `prepend` 不接受锚点，`after` / `before`
 只能与 `grep` / `lines` 搭配。数量不符将拒绝写入。`count` 与 `nth` 互斥。
 
+匹配顺序为精确 → 宽松（忽略行尾空白、按行块相似度）→ 失败时给出最接近的候选；命中多处且未指定
+`nth` / `count` 时拒绝写盘。宽松命中会在结果里带一行 `[warn]`。
+
 ### `write_text` —— 整文件新建/覆盖
 
-`file_path` + `content`（另接受与 `edit_text` 相同的 `diff` / `dry_run` / `note`）；目标不存在时自动
-新建，覆盖前先备份。新建文件的行尾风格取自同目录的多数派（同扩展名优先），默认不写 BOM。
+`file_path` + `content`；目标不存在时自动新建（含补齐缺失的父目录），覆盖前先备份。新建文件的行尾
+风格取自同目录的多数派（同扩展名优先），默认不写 BOM。
 
 ### 返回值
 
-两个工具返回同一份规范值（`OUTPUT_SCHEMA`）。字段内容与去向如下：
+两个工具返回同一份规范值（`OUTPUT_SCHEMA`），只有四个字段：
 
-| 字段                  | 内容                                                                     | 去向             |
-| --------------------- | ------------------------------------------------------------------------ | ---------------- |
-| `path`              | 调用方给出的目标路径（原样回填）                                         | —                |
-| `ok` / `wrote` / `dryRun` | 执行结果标志                                                       | —                |
-| `brief`             | 警告行与一行统计，如 `replace@60 +1/-1`                              | 模型上下文       |
-| `diff`              | 只含 `@@` 块头与改动行的 unified diff（0 上下文行、无 `---` / `+++` 文件头），受**行数 + 字节 + 单行字符数**三重预算约束 | 模型上下文       |
-| `stdout`            | 人读全文：路径头、含上下文行的完整 diff、备份文件名                      | UI / 日志 / 排查 |
-| `stderr`            | 失败原因（失败时非空）                                                   | 模型上下文       |
+| 字段       | 内容                                             | 去向       |
+| ---------- | ------------------------------------------------ | ---------- |
+| `path`   | 调用方给出的目标路径（原样回填）                 | —          |
+| `ok`     | 是否写入成功                                     | —          |
+| `brief`  | 一行统计（如 `replace@17 +1/-1`）与必要的警告行  | 模型上下文 |
+| `stderr` | 失败原因（失败时非空）                           | 模型上下文 |
 
-模型可见文本由 `brief` 与 `diff` 组成，路径在起始行出现一次；`diff` 正文不含 `---` / `+++` 文件头，
-因此路径不会在正文中再次出现。完整 diff 另经 `output.presentationMeta` 投影为
-`{ path, oldText, newText }` 列表，与原生 `edit` / `write` 的卡片词汇同形，由 `presentResult` 交给
-Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
+模型可见文本因此只有两种形状：
 
-失败时不返回 `brief` 与 `diff`：模型可见文本为 `FAIL` 加目标路径，其后是完整的失败原因（由核心生成，
-通常再含一次工作区相对路径）。系统调用失败只报 errno 与一句原因（`ENOENT`、`ENOTDIR`、`EISDIR`、
-`EACCES` 等）：Node 原始 message 中的绝对路径与内部临时文件名（`.<名字>.<pid><ts>.tmp`）不进入模型上下文。
+```
+WROTE <路径>            # 成功：一行统计 + 警告
+replace@17 +1/-1
+FAIL <路径>             # 失败：完整原因（决定下一次调用）
+<原因>
+```
 
-`diff` 参数决定 `diff` 字段的详细程度：
+**成功路径不回显改动内容**：工具结果按追加方式进入会话历史，任何内容回显都会随调用次数累积，而
+调用方刚发过 `new_text`；`replace@17 +1/-1` 已说明改在哪几行、改了多少，需要看正文时 `read` 一次
+即可。因此单次调用的模型可见字节与输入规模无关（实测：400 KB 的单行写入仍只回 2 行 / 90 B）。
 
-| 取值      | 行为                                                                             |
-| --------- | -------------------------------------------------------------------------------- |
-| `auto`  | 默认。正文在三重预算内时给出；超出时不给出正文，附一行省略提示                   |
-| `full`  | 始终给出正文；超出预算时截断，附一行截断提示                                     |
-| `none`  | 不给出正文                                                                       |
+改动记录由备份与台账承担，二者都不进入模型上下文：`.dsh/backups/` 下的原件副本，以及
+`.dsh/edits.log` 的 JSONL（字段见「目录结构」之后）。
 
-正文固定使用 0 上下文行；`context` 配置只影响 `stdout` 与 UI 卡片。三重预算限制单次调用进入模型上下文的
-字节数：工具结果按追加方式进入会话历史，不参与前缀缓存，无上限时整文件重写的返回量与输入量同阶
-（实测 ≈ 1.0x）。
-
-| 预算              | 默认   | 约束对象                                                     |
-| ----------------- | ------ | ------------------------------------------------------------ |
-| `maxDiffLines`  | `30`   | 行数                                                         |
-| `maxDiffBytes`  | `4096` | 字节数；行长很大时行数预算失效，由它兜底                     |
-| `maxDiffLineChars` | `200` | 单行字符数；超出部分截断为 `…[+N chars]`，保留行首标识       |
-
-仅约束行数时，行数少于 30 而单行很长的改动（压缩为单行的文件、宽数据行、替换一行超长文本）仍会整篇
-进入上下文（放大率 1.0x，替换长行时约 2.0x）。三重预算下 `tools/measure-context.mjs` 实测最坏单条结果
-2.2 KB（200 行重写 + `diff:"full"`），长行场景 200–550 B。
+系统调用失败只报 errno 与一句原因（`ENOENT`、`ENOTDIR`、`EISDIR`、`EACCES` 等）：Node 原始 message
+中的绝对路径与内部临时文件名（`.<名字>.<pid><ts>.tmp`）不进入模型上下文。
 
 ## 已知限制
 
@@ -144,18 +125,19 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 
 - **写入不经由 `ctx.fs`。** 文件由本插件直接写入，因此不经过 fs 观察策略（先读后写、版本新鲜度校验）、
   沙箱与 `sandbox_permissions` 审批升权，也不保留 Windows DACL。原子写由本插件自行实现
-  （同目录临时文件 + fsync + rename）；diff 卡片由本插件的 `presentationMeta` 提供，原生工具则取自
-  `ctx.fs` 返回的 `before` / `after`。
+  （同目录临时文件 + fsync + rename）。
 - **行号锚点不做内容校验。** `lines` 与 `before` / `after <行号>` 仅按行号定位：行号有误不会报错，
   改动会落在非预期位置；定位需要可校验时，请改用 `old_text` 或 `grep`。
 - **同目标串行仅限本进程。** 进程内按目标路径排队，并配合原子写，故并行的工具调用不会相互覆盖；
   但另一个 dsh 实例、编辑器或其它进程同时修改同一文件时，仍可能相互覆盖，本插件也不检测外部改动。
 - **仅处理 UTF-8 文本。** 含 NUL 字节的二进制文件与非法 UTF-8 文件一律拒绝；`.git/`、`.dsh/` 内部
-  以及工作区之外的路径一律拒绝写入。
-- **新建文件会补齐缺失的父目录。** `write_text` 目标不存在时按 `mkdir -p` 补齐父目录（与原生 `write`
-  一致）；该动作只在 `stdout` 留一行提示，不进入模型可见文本，`dry_run` 不创建任何目录。
-- **台账失败不改变写入结果。** 目标文件写入成功后，台账等旁路产物失败只在 `stdout` 留一行 `[note]`，
-  结果仍为 `ok`；否则调用方会重试，导致同一次编辑写入两次。
+  以及工作区之外的路径一律拒绝写入（护栏是常量，不可配置）。
+- **新建文件会补齐缺失的父目录。** `write_text` 目标不存在时按 `mkdir -p` 补齐（与原生 `write` 一致）；
+  该动作不产生额外输出。
+- **台账失败不改变写入结果。** 目标文件写入成功后，台账失败只在结果里追加一行 `[warn]`，`ok` 仍为真；
+  否则调用方会重试，导致同一次编辑写入两次。
+- **GUI 里没有 diff 卡片。** 工具不提供 `presentResult` / `presentationMeta`，Web UI 显示的就是模型
+  可见的那两行；审阅改动请用备份、台账或项目自身的 git 差异（如右侧变更面板）。
 
 ## 配置
 
@@ -167,11 +149,6 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 | `ledger`       | `true`          | 往 `artifactsDir/edits.log` 追加一条 JSONL 记录 |
 | `artifactsDir` | `<工作区>/.dsh` | 备份与台账所在目录                               |
 | `newFileBom`   | `false`         | 新建文件时是否写 UTF-8 BOM                       |
-| `context`      | `3`             | `stdout` 与 UI 卡片中 diff 的上下文行数（模型可见正文固定 0 行） |
-| `diff`         | `'auto'`        | `diff` 字段的默认策略（`auto` / `full` / `none`）；逐调用的 `diff` 参数优先 |
-| `maxDiffLines` | `30`            | `diff` 字段的行数上限：`auto` 超出时不给出正文，`full` 超出时截断 |
-| `maxDiffBytes` | `4096`          | `diff` 字段的字节上限（行数合规但行长很大时的兜底） |
-| `maxDiffLineChars` | `200`       | `diff` 单行字符上限：超出的行截断并加 `…[+N chars]` 标注 |
 | `root`         | `process.cwd()` | 无 agent 会话时的回退工作区                      |
 
 环境变量 `DSH_TEXT_EDITOR_EOL`（`lf` \| `crlf`）可覆盖**新建文件**的行尾推断。
@@ -180,31 +157,32 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 
 ```powershell
 # 在本仓库根目录执行
-node tools/selftest.mjs                 # Windows + Node 24 参考结果 107/107
+node tools/selftest.mjs                 # Windows + Node 24 参考结果 80/80
 node tools/check-license.mjs            # 许可证 / 依赖 / 纯 Node 门禁
 node tools/gen-schema.mjs               # 内嵌 schema 是否仍与作者 DSL 一致
-node tools/measure-context.mjs          # 逐场景量模型可见字节（构造场景）
-node tools/audit-session.mjs            # 用真实会话日志对账（含 stdout 泄漏检查）
+node tools/measure-context.mjs          # 逐场景量模型可见字节
+node tools/audit-session.mjs            # 用真实会话日志对账（含文本形状检查）
 ```
 
-`tools/selftest.mjs` 覆盖：BOM 与行尾保真、`dry_run`、四种锚点、`count`、歧义时拒绝写入、用法错误、
-二进制与非法 UTF-8、路径护栏（`.dsh/`、工作区之外）、行尾多数派推断、跨多个 hunk、末尾换行差异、
-并发写入不产生半截文件、新建时补齐父目录、系统调用失败只报 errno；**并含一层插件层断言**：以模拟 ctx
-驱动 `apply()`，验证工具注册、引导段身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 输出，以及
-config 透传（`root` / `backup` / `ledger` / `newFileBom` / `maxDiffBytes` / `maxDiffLineChars`）；
-**以及一层返回值约束断言**：整文件重写不回显内容、长行被截断、宽文件不整篇回显、小改动仍给出改动行、
-`diff` 三种取值的行为边界、路径仅出现一次、完整 diff 只经 `presentationMeta` 投影。
+`npm test` 串起许可证门禁、自测与 `measure-context --cap 2048`；后者保证任何一次调用的模型可见文本
+都不超过 2 KB——当前实现的最坏场景是 1.6 KB 的歧义提示，成功路径固定 2 行 / 约 90 B。
+
+`tools/selftest.mjs` 覆盖：BOM 与行尾保真、四种锚点、`count`、歧义时拒绝写入、宽松匹配通报、用法错误、
+二进制与非法 UTF-8、路径护栏（`.dsh/`、工作区之外）、行尾多数派推断、多 hunk、末尾换行差异、并发写入
+不产生半截文件、新建时补齐父目录、系统调用失败只报 errno；**并含一层插件层断言**：以模拟 ctx 驱动
+`apply()`，验证工具注册、引导段身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 的字面形状，以及
+config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**以及一层返回值约束断言**：无论输入多大，
+成功路径都只有两行，且不含改动内容。
 
 ### 上下文开销的测量
 
 `tools/measure-context.mjs` 以模拟 ctx 驱动 `apply()`，走真实的 `execute()` → `output.render()` 路径，
-逐场景输出入参字节、模型可见字节、倍率与 UI 元数据字节。`--cap N`：任一场景超过 N 字节即退出码 1
-（`npm test` 使用 `--cap 4096`）。`--static` 输出每请求的静态开销；`--vs-native` 追加宿主 `write` /
-`edit` 的同一组数据（未找到 dsh 安装时输出 SKIP）。
+逐场景输出入参字节、模型可见字节、倍率与行数。`--cap N`：任一场景超过 N 字节即退出码 1。`--static`
+输出每请求的静态开销；`--vs-native` 追加宿主 `write` / `edit` 的同一组数据（未找到 dsh 安装时输出 SKIP）。
 
 `tools/audit-session.mjs` 以真实会话日志（`<DSH_HOME>/sessions/`，分帧 zstd，按调用对账）核对两项：
-stdout 专用行是否进入模型可见文本、单条结果是否超过 `--cap`（默认 8192 B）。仓库开发期会话中 158 条
-结果含完整 stdout（单条最大 12.5 KB），三重预算实现为 0 条。
+结果文本的形状是否符合上面两种之一（出现 diff 正文、`=== ` 头、`OK ` 尾、备份名或内部临时文件名即
+报告）、单条结果是否超过 `--cap`（默认 1024 B）。
 
 `tools/gen-schema.mjs` 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：它会在 dsh profile 的
 `node_modules` 与 npm 全局目录中自动查找，也可用 `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码为 2。
@@ -212,7 +190,7 @@ stdout 专用行是否进入模型可见文本、单条结果是否超过 `--cap
 ## 目录结构
 
 ```
-lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、diff、备份、台账、原子写、同目标串行
+lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、备份、台账、原子写、同目标串行
 lib/editor.mjs           # 插件本体：schema、参数校验、工具注册（零依赖 ESM，无构建）
 preset/preset.yml        # preset 的名字/描述（dsh 列表里显示的内容）
 scripts/install-preset.mjs  # 从本机 dsh 派生用户 preset
@@ -220,8 +198,8 @@ cordis.patch.yml         # 宿主平面安装用的 bundle patch
 tools/selftest.mjs       # 端到端自测（核心 + 插件层）
 tools/check-license.mjs  # 许可证 / 依赖 / 纯 Node 卫生门禁
 tools/gen-schema.mjs     # 内嵌 schema 的权威来源与校验器
-tools/measure-context.mjs  # 模型可见字节的逐场景测量（构造场景）
-tools/audit-session.mjs  # 真实会话日志的上下文对账 + stdout 泄漏检查
+tools/measure-context.mjs  # 模型可见字节的逐场景测量
+tools/audit-session.mjs  # 真实会话日志的上下文对账 + 文本形状检查
 ```
 
 备份与台账采用固定的命名与字段：每次编辑在 `.dsh/backups/` 下留存一个文件，命名为

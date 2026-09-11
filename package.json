@@ -1,7 +1,7 @@
 {
   "name": "@flotiarenor/dsh-tool-text-editor",
-  "version": "1.1.2",
-  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness: they preserve a UTF-8 BOM and the file's own CRLF/LF style (the built-in write/edit tools do not), back the previous content up, accept grep/lines anchors, and return a bounded result: one stat line plus a diff body limited by maxDiffLines, maxDiffBytes and a per-line character cap, while the complete diff is projected to the UI card and never enters the model context. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
+  "version": "1.2.0",
+  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness. They fix three defects of the built-in write/edit (which drop a UTF-8 BOM, flatten CRLF to LF, and match old_string exactly): they preserve the BOM and the file's own CRLF/LF style, fall back to relaxed line-block matching with nearest-candidate hints, back the previous content up, accept grep/lines anchors, and return one stat line instead of echoing the change back into the model context. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
   "type": "module",
   "main": "lib/editor.mjs",
   "exports": {
@@ -15,13 +15,13 @@
     }
   },
   "scripts": {
-    "test": "node tools/check-license.mjs && node tools/selftest.mjs && node tools/measure-context.mjs --cap 4096",
+    "test": "node tools/check-license.mjs && node tools/selftest.mjs && node tools/measure-context.mjs --cap 2048",
     "check": "node tools/check-license.mjs",
     "check:license": "node tools/check-license.mjs",
     "check:schema": "node tools/gen-schema.mjs",
     "selftest": "node tools/selftest.mjs",
     "measure": "node tools/measure-context.mjs",
-    "measure:cap": "node tools/measure-context.mjs --cap 4096",
+    "measure:cap": "node tools/measure-context.mjs --cap 2048",
     "measure:static": "node tools/measure-context.mjs --static --vs-native",
     "audit": "node tools/audit-session.mjs",
     "install:preset": "node scripts/install-preset.mjs",

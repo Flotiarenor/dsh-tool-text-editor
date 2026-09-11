@@ -4,14 +4,15 @@
  * selftest.mjs —— `lib/` 的端到端自测（不需要 dsh 会话）。
  *
  * 三层断言：
- *   * 共享行为 —— 通过 `applyPlan` 直接跑核心（BOM/行尾保真、diff、四种锚点、count、歧义拒写）；
- *   * Node 独有保证 —— 路径护栏、二进制/非法 UTF-8 拒写、多数派行尾推断、多 hunk、并发不撕裂；
- *   * 插件层 —— 用假 ctx 走一遍 `lib/editor.mjs` 的 `apply()`：工具注册、引导段、参数校验、
- *     **返回值与 `OUTPUT_SCHEMA` 一致**、`render()` 文本、以及 config（root/backup/ledger/newFileBom）
- *     的透传。这一层是宿主真正调用的入口，必须被测到，否则 schema 与返回值脱节也只能等线上发现；
- *   * 返回值约束 —— 模型可见文本的构成本身是被断言对象：整文件重写不得回显内容、小改动仍须
- *     给出改动行、`diff` 三种取值各自的行为边界、路径仅出现一次，以及完整 diff 只经
- *     `presentationMeta` 投影。这些是工具契约的一部分，因此需要回归测试。
+ *   * 共享行为 —— 通过 `applyPlan` 直接跑核心（BOM/行尾保真、锚点、匹配、count、歧义拒写）；
+ *   * Node 独有保证 —— 路径护栏、二进制/非法 UTF-8 拒写、多数派行尾推断、多 hunk、并发不撕裂、
+ *     新建时补齐父目录、系统调用失败只报 errno；
+ *   * 插件层 —— 用假 ctx 走一遍 `lib/editor.mjs` 的 `apply()`：工具注册、引导段、
+ *     参数校验、**返回值与 `OUTPUT_SCHEMA` 一致**、`render()` 文本，以及 config
+ *     （`root` / `backup` / `ledger` / `newFileBom`）的透传。这一层是宿主真正调用的入口，必须被测到，
+ *     否则 schema 与返回值脱节也只能等线上发现；
+ *   * 返回值约束 —— 模型可见文本的构成本身是被断言对象：无论输入多大，成功路径固定为
+ *     `WROTE <路径>` 加一行统计，且不含改动内容。这是工具契约的一部分，因此需要回归测试。
  *
  * 实现全部是进程内 Node（不启动子进程、无外部运行时），所以自测本身也只依赖 Node。
  *
@@ -19,7 +20,6 @@
  *   node tools/selftest.mjs
  * 退出码：0 = 全过，1 = 有失败。
  */
-
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -81,7 +81,7 @@ function assertShape(label, value) {
   check(label, missing.length === 0 && extra.length === 0 && wrong.length === 0, `missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)} wrongType=${JSON.stringify(wrong)}`)
 }
 
-/** 核心共享断言：BOM / 行尾 / diff / 锚点 / count / dry_run。 */
+/** 核心共享断言：BOM / 行尾 / 锚点 / count / 歧义拒写。 */
 async function sharedSuite(runner) {
   const { ws, edit, write } = runner
   const sample = join(ws, 'sample.md')
@@ -96,11 +96,10 @@ async function sharedSuite(runner) {
     const bytes = readFileSync(sample)
     const text = readFileSync(sample, 'utf8')
     check('edit(grep): ok', result.ok, result.stderr)
-    check('edit(grep): wrote=true', result.wrote === true, JSON.stringify(result))
     check('edit(grep): BOM preserved', bomOf(bytes))
     check('edit(grep): CRLF preserved', countCrlf(bytes) === 3, `crlf=${countCrlf(bytes)} lf=${countLf(bytes)}`)
     check('edit(grep): content replaced', text.includes('gamma patched'))
-    check('edit(grep): unified diff in stdout', result.stdout.includes('@@') && result.stdout.includes('+gamma patched'), result.stdout)
+    check('edit(grep): brief is one stat line', result.brief === 'replace@3 +1/-1', JSON.stringify(result.brief))
   }
 
   {
@@ -109,16 +108,6 @@ async function sharedSuite(runner) {
     check('edit(old_text): ok', result.ok, result.stderr)
     check('edit(old_text): BOM + CRLF preserved', bomOf(bytes) && countCrlf(bytes) === 3)
     check('edit(old_text): content replaced', readFileSync(sample, 'utf8').includes('gamma again'))
-  }
-
-  {
-    const before = readFileSync(sample)
-    const result = await edit({ file_path: 'sample.md', grep: '^alpha', new_text: 'ALPHA\n', dry_run: true })
-    const after = readFileSync(sample)
-    check('edit(dry_run): ok', result.ok, result.stderr)
-    check('edit(dry_run): wrote=false, dryRun=true', result.wrote === false && result.dryRun === true, JSON.stringify(result))
-    check('edit(dry_run): file untouched', before.equals(after))
-    check('edit(dry_run): diff still printed', result.stdout.includes('ALPHA'), result.stdout)
   }
 
   {
@@ -138,7 +127,7 @@ async function sharedSuite(runner) {
   {
     await write({ file_path: 'amb.md', content: 'twin\ntwin\nother\n' })
     const result = await edit({ file_path: 'amb.md', old_text: 'twin', new_text: 'x' })
-    const detail = result.stdout + '\n' + result.stderr
+    const detail = result.brief + '\n' + result.stderr
     check('edit(ambiguous): refuses to write', !result.ok, JSON.stringify(result))
     check('edit(ambiguous): explains count/nth', /count|nth/.test(detail), detail)
     const forced = await edit({ file_path: 'amb.md', old_text: 'twin', new_text: 'x', count: 2 })
@@ -172,15 +161,9 @@ async function sharedSuite(runner) {
     check('write(create in a CRLF dir): ok', result.ok, result.stderr)
     check('write(create in a CRLF dir): CRLF followed', countCrlf(bytes) === 2, `crlf=${countCrlf(bytes)} lf=${countLf(bytes)}`)
   }
-
-  {
-    const result = await write({ file_path: 'dry.md', content: 'nope\n', dry_run: true })
-    check('write(dry_run on a missing file): ok', result.ok, result.stderr)
-    check('write(dry_run): nothing created', !existsSync(join(ws, 'dry.md')))
-  }
 }
 
-/** Node 独有：护栏、二进制/非法编码、多数派行尾、diff 边界、并发。 */
+/** Node 独有：护栏、二进制/非法编码、多数派行尾、锚点边界、并发。 */
 async function nodeOnlySuite(ws) {
   const run = async (args) => await applyPlan(planEdit(args), { root: ws })
   const write = async (args) => await applyPlan(planWrite(args), { root: ws })
@@ -218,7 +201,7 @@ async function nodeOnlySuite(ws) {
   {
     writeFileSync(join(ws, 'multi.md'), 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n')
     const result = await run({ file_path: 'multi.md', grep: '^b', new_text: 'B\n' })
-    check('single-line change yields one hunk', result.ok && (result.stdout.match(/^@@/gm) ?? []).length === 1, result.stdout)
+    check('a single-line change reports one replace@ line', result.ok && result.brief === 'replace@2 +1/-1', JSON.stringify(result.brief))
   }
   {
     writeFileSync(join(ws, 'two-far.md'), 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\n')
@@ -230,7 +213,7 @@ async function nodeOnlySuite(ws) {
     writeFileSync(join(ws, 'noeol.md'), 'tail without newline')
     const result = await run({ file_path: 'noeol.md', old_text: 'tail without newline', new_text: 'now with newline\n' })
     const text = readFileSync(join(ws, 'noeol.md'), 'utf8')
-    check('end-of-file newline change is diffed', result.ok && result.stdout.includes('No newline at end of file'), result.stdout)
+    check('end-of-file newline change is accepted', result.ok, result.stderr)
     check('end-of-file newline change written', text === 'now with newline\n', JSON.stringify(text))
   }
   {
@@ -254,28 +237,23 @@ async function nodeOnlySuite(ws) {
   }
   {
     writeFileSync(join(ws, 'relaxed.md'), 'keep   trailing\nnext line\n')
-    const result = await run({ file_path: 'relaxed.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n', dry_run: true })
-    check('a relaxed match is announced', result.ok && /宽松/.test(result.stdout), result.stdout || result.stderr)
+    const result = await run({ file_path: 'relaxed.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n' })
+    check('a relaxed match is announced in the brief', result.ok && /宽松/.test(result.brief), result.brief || result.stderr)
   }
   {
-    const result = await run({ file_path: 'sample.md', grep: '^one$', new_text: 'ONE\n', dry_run: true })
-    check('a no-change edit is refused', !result.ok || result.stdout.includes('ONE'), result.stdout + result.stderr)
+    const result = await run({ file_path: 'sample.md', grep: '^one$', new_text: 'one\n' })
+    check('a no-change edit is refused', !result.ok && /没有产生任何变化/.test(result.stderr), result.stderr)
   }
   {
-    // 新建时补齐缺失的父目录（原生 write 也这么做）；提示只落在 stdout，不进模型可见文本
+    // 新建时补齐缺失的父目录（原生 write 也这么做），且不为此多说一句
     const result = await write({ file_path: 'deep/nested/fresh.md', content: 'a\nb\n' })
     check(
       'write(create) fills in missing parent directories',
       result.ok && existsSync(join(ws, 'deep', 'nested', 'fresh.md')),
       result.stderr || JSON.stringify(result),
     )
-    check(
-      'write(create) reports the new directory in stdout only',
-      result.stdout.includes('新建了目录') && !result.brief.includes('新建了目录'),
-      result.stdout,
-    )
-    const dry = await write({ file_path: 'no-such-dir/fresh.md', content: 'x\n', dry_run: true })
-    check('a dry run creates no directories', dry.ok && !existsSync(join(ws, 'no-such-dir')), JSON.stringify(dry))
+    check('write(create) keeps the brief to one stat line', result.brief === 'write +2/-0', JSON.stringify(result.brief))
+    check('write(create) returns only the documented fields', Object.keys(result).sort().join(',') === 'brief,ok,path,stderr', Object.keys(result).join(','))
   }
   {
     // 系统调用失败：只给 errno 说法；内部临时文件名（.<名字>.<pid><ts>.tmp）绝不出现在原因里
@@ -337,13 +315,13 @@ async function pluginSuite() {
     const bytes = readFileSync(join(ws, 'plugin.md'))
     check(
       'plugin: edit_text writes into the session workspace (BOM + CRLF kept)',
-      result.ok === true && result.wrote === true && bomOf(bytes) && countCrlf(bytes) === 3,
+      result.ok === true && bomOf(bytes) && countCrlf(bytes) === 3,
       JSON.stringify(result),
     )
     const rendered = editTool.output.render({}, result)
     check(
-      'plugin: success render says WROTE and carries the diff',
-      rendered[0].text.startsWith('WROTE plugin.md') && rendered[0].text.includes('+BETA'),
+      'plugin: success render is WROTE plus one stat line, and never echoes the change',
+      rendered[0].text === 'WROTE plugin.md\nreplace@2 +1/-1',
       rendered[0].text,
     )
 
@@ -371,16 +349,6 @@ async function pluginSuite() {
     check('plugin: failure render says FAIL', editTool.output.render({}, result)[0].text.startsWith('FAIL plugin.md'))
     check('plugin: failure render keeps the reason', editTool.output.render({}, result)[0].text.includes('anchor'))
   }
-  {
-    const before = readFileSync(join(ws, 'plugin.md'))
-    const result = await writeTool.execute({ file_path: 'plugin.md', content: 'nope\n', dry_run: true }, exec)
-    check(
-      'plugin: dry_run renders DRY RUN and does not write',
-      result.dryRun === true && before.equals(readFileSync(join(ws, 'plugin.md'))) && writeTool.output.render({}, result)[0].text.startsWith('DRY RUN'),
-      JSON.stringify(result),
-    )
-  }
-
   rmSync(ws, { recursive: true, force: true })
 
   // config 透传：newFileBom / backup+ledger / 没有 agent 会话时的 root 回退
@@ -400,11 +368,11 @@ async function pluginSuite() {
 }
 
 /**
- * 返回值约束：模型可见文本的构成与 `diff` 取值边界。
+ * 返回值约束：模型可见文本的构成。
  *
- * 断言依据来自实测：整文件重写的 unified diff 每一行都带 `+`，回吐量与输入内容同量级
- * （放大率 ≈ 1.0x）；旧实现的单条结果里路径重复出现五次、备份的扁平化绝对路径名也进入模型
- * 上下文；且 `diff: full` 没有行数上限。
+ * 契约只有两条：成功是 `WROTE <路径>` 加**一行统计**（不回显改动内容），失败是 `FAIL <路径>` 加完整
+ * 原因。这里把"任何规模的改动都不回显"钉成断言——旧实现曾把整文件 diff 当成结果正文，长行的
+ * 改动甚至以 1.0x 的放大率原样进入上下文。
  */
 async function resultTextSuite() {
   const ws = makeWorkspace('dsh-selftest-result-')
@@ -420,121 +388,59 @@ async function resultTextSuite() {
   const textOf = (tool, result) => tool.output.render({}, result)[0].text
 
   const big = Array.from({ length: 60 }, (_, i) => `line ${i + 1} of the big file`).join('\n') + '\n'
-  const bigLines = big.trimEnd().split('\n')
 
-  // 1) 整文件重写与新建：模型可见文本不得回显文件内容
+  // 1) 整文件新建：模型可见文本只有两行，且不含文件内容
   const created = await writeTool.execute({ file_path: 'big.txt', content: big }, exec)
   const createdText = textOf(writeTool, created)
   check(
     'result: a large write does not echo the content back',
-    !createdText.includes('line 30 of the big file') && createdText.includes('[diff omitted'),
+    !createdText.includes('line 30 of the big file') && createdText === 'WROTE big.txt\nwrite +60/-0',
     createdText,
   )
-  check('result: that result is a stat line plus the hint, nothing else', createdText.split('\n').length === 3, JSON.stringify(createdText))
-  check('result: stdout still carries the full human diff', created.stdout.includes('@@') && created.stdout.includes('+line 30 of the big file'))
   check('result: the path appears exactly once in the rendered text', createdText.split('big.txt').length - 1 === 1, createdText)
 
-  // 2) 小改动：仍须给出改动行，以便调用方核对
+  // 2) 小改动同样是两行
   writeSample(join(ws, 'small.txt'), ['alpha', 'beta', 'gamma'])
   const small = await editTool.execute({ file_path: 'small.txt', grep: '^beta', new_text: 'BETA\n' }, exec)
   const smallText = textOf(editTool, small)
-  check('result: a small edit still shows the changed lines', smallText.includes('-beta') && smallText.includes('+BETA'), smallText)
-  check('result: the model-facing diff carries no context lines', !smallText.includes(' alpha'), smallText)
-  check('result: the rendered text no longer carries the backup name', !smallText.includes('备份'), smallText)
-  check('result: the path still appears exactly once when a body is present', smallText.split('small.txt').length - 1 === 1, smallText)
-  check('result: the model-facing body carries no file headers', !smallText.includes('--- ') && !smallText.includes('+++ '), smallText)
-  check('result: the standard headers are still in stdout', small.stdout.includes('--- a/small.txt') && small.stdout.includes('+++ b/small.txt'), small.stdout)
-
-  // 3) diff: none —— 只留统计行
-  const silent = await editTool.execute({ file_path: 'small.txt', grep: '^BETA', new_text: 'beta\n', diff: 'none' }, exec)
+  check('result: a small edit reports the stat line only', smallText === 'WROTE small.txt\nreplace@2 +1/-1', smallText)
   check(
-    'result: diff:none keeps only the stat line',
-    textOf(editTool, silent) === 'WROTE small.txt\nreplace@2 +1/-1',
-    textOf(editTool, silent),
+    'result: no diff body, no backup name, no change content',
+    !smallText.includes('BETA') && !smallText.includes('beta') && !smallText.includes('备份'),
+    smallText,
   )
 
-  // 4) diff: full：始终给出正文，仍受上限约束
-  const rewrite = bigLines.map((line) => 'X' + line).join('\n') + '\n'
-  const capped = await writeTool.execute({ file_path: 'big.txt', content: rewrite, diff: 'full' }, exec)
-  const cappedText = textOf(writeTool, capped)
-  check(
-    'result: diff:full still stops at maxDiffLines',
-    cappedText.includes('[diff truncated:') && cappedText.split('\n').length <= 33,
-    `lines=${cappedText.split('\n').length}\n${cappedText}`,
-  )
-  const raised = await editTool.execute({ file_path: 'small.txt', grep: '^beta', new_text: 'BETA\n', diff: 'full' }, exec)
-  check(
-    'result: diff:full returns the whole diff when it fits the budget',
-    textOf(editTool, raised).includes('-beta') && textOf(editTool, raised).includes('+BETA') && !textOf(editTool, raised).includes('truncated'),
-    textOf(editTool, raised),
-  )
-
-  // 5) 长行：行数预算管不住的那一类（压缩后的单行文件、宽数据行）
+  // 3) 长行：压缩为单行的文件曾经整篇进入上下文，现在与文件大小无关
   const longLine = 'const blob = "' + 'x'.repeat(20000) + '"'
   const longWrite = await writeTool.execute({ file_path: 'min.js', content: longLine + '\n' }, exec)
   const longText = textOf(writeTool, longWrite)
   check(
-    'result: a single 20 KB line does not come back whole',
-    !longText.includes('x'.repeat(400)) && Buffer.byteLength(longText, 'utf8') < 1200,
+    'result: a single 20 KB line is not echoed',
+    longText === 'WROTE min.js\nwrite +1/-0' && Buffer.byteLength(longText, 'utf8') < 64,
     `${Buffer.byteLength(longText, 'utf8')} B\n${longText}`,
   )
-  check('result: a clamped line says how much it dropped', /…\[\+\d+ chars\]/.test(longText), longText)
-  check(
-    'result: stdout still carries the untouched line',
-    longWrite.stdout.includes('x'.repeat(20000)),
-    `stdout bytes=${Buffer.byteLength(longWrite.stdout, 'utf8')}`,
-  )
 
+  // 4) 宽文件（行数少、行长）同样不回显
   const wide = Array.from({ length: 20 }, (_, i) => `L${i} ${'y'.repeat(5000)}`).join('\n') + '\n'
-  const wideWrite = await writeTool.execute({ file_path: 'wide.txt', content: wide }, exec)
-  const wideText = textOf(writeTool, wideWrite)
+  const wideText = textOf(writeTool, await writeTool.execute({ file_path: 'wide.txt', content: wide }, exec))
+  check('result: 20 lines x 5 KB is not echoed', wideText === 'WROTE wide.txt\nwrite +20/-0', wideText)
+
+  // 5) 一次调用回吐的字节与输入规模无关：这是本契约的核心
+  const hugeText = textOf(writeTool, await writeTool.execute({ file_path: 'huge.txt', content: 'z'.repeat(400000) + '\n' }, exec))
   check(
-    'result: 20 lines x 5 KB is omitted, not echoed',
-    wideText.includes('[diff omitted') && Buffer.byteLength(wideText, 'utf8') < 512,
-    `${Buffer.byteLength(wideText, 'utf8')} B\n${wideText}`,
-  )
-  const wideFull = await writeTool.execute({ file_path: 'wide2.txt', content: wide, diff: 'full' }, exec)
-  check(
-    'result: diff:full respects the byte budget too',
-    Buffer.byteLength(wideFull.diff, 'utf8') <= 4096 && wideFull.diff.includes('[diff truncated:'),
-    `${Buffer.byteLength(wideFull.diff, 'utf8')} B\n${wideFull.diff.slice(0, 300)}`,
+    'result: a 400 KB write still returns a two-line result',
+    hugeText === 'WROTE huge.txt\nwrite +1/-0',
+    `${Buffer.byteLength(hugeText, 'utf8')} B\n${hugeText}`,
   )
 
-  // 6) 完整 diff（含上下文行）只走 UI 卡片那条路径
-  const uiMeta = writeTool.output.presentationMeta({}, created)
+  // 6) 失败路径相反：原因必须完整
+  const missing = await editTool.execute({ file_path: 'nope.md', grep: 'x', new_text: 'y\n' }, exec)
+  const failText = textOf(editTool, missing)
   check(
-    'result: presentationMeta keeps the whole new file for the UI (pure insertion uses oldText null)',
-    uiMeta.diffs.length === 1 && uiMeta.diffs[0].oldText === null && uiMeta.diffs[0].newText === big.trimEnd(),
-    JSON.stringify(uiMeta.diffs).slice(0, 200),
+    'result: a failure keeps the full reason',
+    failText.startsWith('FAIL nope.md\n') && failText.includes('目标不存在'),
+    failText,
   )
-  const editMeta = editTool.output.presentationMeta({}, small)
-  check(
-    'result: presentationMeta keeps context lines for the UI on an edit',
-    editMeta.diffs.length === 1 && editMeta.diffs[0].path === 'small.txt'
-      && editMeta.diffs[0].oldText.includes('beta') && editMeta.diffs[0].newText.includes('BETA'),
-    JSON.stringify(editMeta.diffs),
-  )
-  const card = writeTool.presentResult({}, { isError: false, meta: uiMeta })
-  check('result: presentResult hands that card to the UI', card !== undefined && card.card === 'diff', JSON.stringify(card))
-  const dryMeta = writeTool.output.presentationMeta({}, { ok: true, wrote: false, dryRun: true, stdout: '', path: 'x' })
-  check('result: a dry run offers no diff card (nothing was applied)', writeTool.presentResult({}, { isError: false, meta: dryMeta }) === undefined)
-  check('result: a failed call offers no diff card', writeTool.presentResult({}, { isError: true, meta: uiMeta }) === undefined)
-
-  // 7) 配置：两档新预算都能被 preset 行收紧（默认 30 行 / 4096 B / 200 字符）
-  const tightWs = makeWorkspace('dsh-selftest-budget-')
-  const tight = []
-  apply(
-    { systemPrompt: { section: () => {} }, tools: { register: (value) => tight.push(value) } },
-    { root: tightWs, maxDiffBytes: 120, maxDiffLineChars: 10 },
-  )
-  const tightWrite = tight.find((tool) => tool.name === 'write_text')
-  const tightTextOf = (result) => tightWrite.output.render({}, result)[0].text
-  const manyShort = Array.from({ length: 12 }, () => 'aaaaaaaaaa').join('\n') + '\n'
-  const overBytes = tightTextOf(await tightWrite.execute({ file_path: 'bytes.txt', content: manyShort }, {}))
-  check('config: maxDiffBytes is honoured', overBytes.includes('[diff omitted'), overBytes)
-  const oneLong = tightTextOf(await tightWrite.execute({ file_path: 'chars.txt', content: 'a'.repeat(30) + '\n' }, {}))
-  check('config: maxDiffLineChars is honoured', /…\[\+\d+ chars\]/.test(oneLong), oneLong)
-  rmSync(tightWs, { recursive: true, force: true })
 
   rmSync(ws, { recursive: true, force: true })
 }
@@ -551,7 +457,6 @@ function usageSuite() {
     ['empty file_path', { file_path: '  ', grep: 'a', new_text: 'a' }],
     ['missing file_path', { grep: 'a', new_text: 'a' }],
     ['missing new_text', { file_path: 'x', grep: 'a' }],
-    ['bad diff mode', { file_path: 'x', grep: 'a', new_text: 'a', diff: 'sometimes' }],
   ]
   for (const [label, args] of editCases) {
     let rejected = false
@@ -562,7 +467,7 @@ function usageSuite() {
     }
     check(`usage error rejected: ${label}`, rejected)
   }
-  for (const [label, args] of [['write without content', { file_path: 'x' }], ['write with non-string content', { file_path: 'x', content: 5 }], ['write with bad diff mode', { file_path: 'x', content: 'a', diff: 'later' }]]) {
+  for (const [label, args] of [['write without content', { file_path: 'x' }], ['write with non-string content', { file_path: 'x', content: 5 }]]) {
     let rejected = false
     try {
       planWrite(args)
