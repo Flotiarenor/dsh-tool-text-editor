@@ -102,7 +102,7 @@ Both tools return the same canonical value (`OUTPUT_SCHEMA`). Field contents and
 | `path` | the target path as supplied by the caller, echoed back | — |
 | `ok` / `wrote` / `dryRun` | outcome flags | — |
 | `brief` | warning lines plus one stat line, e.g. `replace@60 +1/-1` | model context |
-| `diff` | a unified diff of the changed lines only (`@@` hunk headers, 0 context lines, no `---` / `+++` file headers), limited by `maxDiffLines` | model context |
+| `diff` | a unified diff of the changed lines only (`@@` hunk headers, 0 context lines, no `---` / `+++` file headers), bounded by **lines + bytes + per-line characters** | model context |
 | `stdout` | the full human record: path header, complete diff with context lines, backup filename | UI / logs / triage |
 | `stderr` | failure reason (non-empty on failure) | model context |
 
@@ -114,21 +114,34 @@ handed to the Web UI by `presentResult`; that metadata is persisted with `tool/r
 enters the model context.
 
 On failure neither `brief` nor `diff` is returned: the model-facing text is `FAIL` plus the target
-path, followed by the complete failure reason. That reason is produced by the core and usually
-contains the workspace-relative path once more (a failure favours a complete reason).
+path, followed by the complete failure reason (produced by the core, usually containing the
+workspace-relative path once more). A failing system call is reported as errno plus one reason
+(`ENOENT`, `ENOTDIR`, `EISDIR`, `EACCES`, …): the absolute paths and internal temp filename
+(`.<name>.<pid><ts>.tmp`) carried by the raw Node message do not enter the model context.
 
 The `diff` argument selects the detail level of the `diff` field:
 
 | Value | Behavior |
 |---|---|
-| `auto` | default. The body is returned when it fits within `maxDiffLines`; otherwise it is omitted with a one-line note |
-| `full` | the body is always returned; it is truncated with a one-line note when it exceeds `maxDiffLines` |
+| `auto` | default. The body is returned when it fits all three budgets; otherwise it is omitted with a one-line note |
+| `full` | the body is always returned; it is truncated with a one-line note when it exceeds the budgets |
 | `none` | no body is returned |
 
-The body always uses 0 context lines; the `context` setting affects `stdout` and the UI card only.
-`maxDiffLines` bounds the bytes returned to the model context by a single call: tool results are
-appended to the session history and are not prefix-cached, so without a bound a full-file rewrite
-produces a return of the same order as the content just sent (a measured ~1.0x amplification).
+The body always uses 0 context lines; the `context` setting affects `stdout` and the UI card only. The
+three budgets bound the bytes a single call puts into the model context: tool results are appended to
+the session history and are not prefix-cached, so without a bound a full-file rewrite returns the same
+order of magnitude as the content just sent (measured at ~1.0x).
+
+| Budget | Default | Bounds |
+|---|---|---|
+| `maxDiffLines` | `30` | line count |
+| `maxDiffBytes` | `4096` | total body bytes; the backstop that applies when the lines are few but long |
+| `maxDiffLineChars` | `200` | characters per line; the excess is clamped to `…[+N chars]`, keeping the line prefix |
+
+With a line-count budget alone, a change of fewer than 30 very long lines (a file minified to one line,
+wide data rows, a swap of one long line) still entered the model context whole (1.0x, about 2.0x when
+replacing a long line). With all three budgets, `tools/measure-context.mjs` measures a worst single
+result of 2.2 KB (200-line rewrite with `diff:"full"`) and 200-550 B for the long-line cases.
 
 ## Deliberate limitations
 
@@ -148,6 +161,12 @@ the tools.
   other process writing the same file still can, and external changes are not detected.
 - **UTF-8 text only.** Files containing NUL bytes (binary) or invalid UTF-8 are refused, as are paths
   inside `.git/` or `.dsh/` and paths outside the workspace.
+- **Creating a file fills in missing parent directories.** When the `write_text` target does not exist,
+  parents are created (`mkdir -p`, as the built-in `write` does). The action leaves one line in `stdout`
+  and never enters the model-facing text; `dry_run` creates nothing.
+- **A failed ledger append does not change the write outcome.** Once the target file is written, a
+  failure of a side channel (the ledger, or anything after the write) adds a `[note]` line to `stdout`
+  and the result stays `ok`; reporting failure would make the caller retry a write that already landed.
 
 ## Configuration
 
@@ -162,6 +181,8 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 | `context` | `3` | context lines in the diff of `stdout` and the UI card (the model-facing body always uses 0) |
 | `diff` | `'auto'` | default policy for the `diff` field (`auto` / `full` / `none`); a per-call `diff` argument takes precedence |
 | `maxDiffLines` | `30` | line limit for the `diff` field: `auto` omits the body when exceeded, `full` truncates at it |
+| `maxDiffBytes` | `4096` | byte limit for the `diff` field (the backstop when the lines are few but long) |
+| `maxDiffLineChars` | `200` | per-line character limit: a longer line is clamped to `prefix…[+N chars]` |
 | `root` | `process.cwd()` | fallback workspace when a call has no agent session |
 
 `DSH_TEXT_EDITOR_EOL` (`lf` \| `crlf`) overrides the line-ending inference for **new** files.
@@ -170,23 +191,41 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 
 ```powershell
 # run from the root of a clone of this repository
-node tools/selftest.mjs        # 92/92 on Windows + Node 24
-node tools/check-license.mjs   # license / dependency / Node-only gate
-node tools/gen-schema.mjs      # embedded schemas still match the DSL
+node tools/selftest.mjs                 # 107/107 on Windows + Node 24
+node tools/check-license.mjs            # license / dependency / Node-only gate
+node tools/gen-schema.mjs               # embedded schemas still match the DSL
+node tools/measure-context.mjs          # per-scenario model-visible bytes (synthetic)
+node tools/audit-session.mjs            # reconcile against real session logs (+ stdout leak check)
 ```
 
-These three live in the repository only: `tools/` is deliberately outside the `files` whitelist, so
+These live in the repository only: `tools/` is deliberately outside the `files` whitelist, so
 the published package is just the plugin, its preset installer, the docs and the license.
 
 `tools/selftest.mjs` covers BOM/EOL fidelity, `dry_run`, all four anchor kinds, `count`, ambiguity
 refusal, usage errors, binary/invalid-UTF-8 refusal, `.dsh/` and outside-workspace guards, majority
-EOL inference, multi-hunk diffs, end-of-file newline changes and concurrent writes — **plus a
-plugin-layer suite** that drives `apply()` with a fake context and asserts tool registration, the
-guidance section, that every returned value satisfies `OUTPUT_SCHEMA`, the `render()` text, and the
-config plumbing (`root` / `backup` / `ledger` / `newFileBom`) — **and a return-value suite**: a
-full-file rewrite must not echo the content back, a small edit must still report the changed lines,
-the three `diff` values must hold their documented boundaries, the path must appear once, and the
-complete diff must be projected only through `presentationMeta`.
+EOL inference, multi-hunk diffs, end-of-file newline changes, concurrent writes, parent-directory
+creation and errno-only failure text — **plus a plugin-layer suite** that drives `apply()` with a fake
+context and asserts tool registration, the guidance section, that every returned value satisfies
+`OUTPUT_SCHEMA`, the `render()` text, and the config plumbing (`root` / `backup` / `ledger` /
+`newFileBom` / `maxDiffBytes` / `maxDiffLineChars`) — **and a return-value suite**: a full-file rewrite
+must not echo the content back, a very long line must be clamped, a wide file must not come back whole,
+a small edit must still report the changed lines, the three `diff` values must hold their documented
+boundaries, the path must appear once, and the complete diff must be projected only through
+`presentationMeta`.
+
+### Measuring context cost
+
+`tools/measure-context.mjs` drives `apply()` on a simulated context through the real
+`execute()` → `output.render()` path, printing input bytes, model-visible bytes, ratio and UI metadata
+bytes per scenario. `--cap N` exits 1 when any scenario exceeds N bytes (`npm test` runs it with
+`--cap 4096`); `--static` prints the per-request overhead; `--vs-native` adds the same figures for the
+host's `write` / `edit` (SKIP when no dsh installation is found).
+
+`tools/audit-session.mjs` reconciles against real session logs (`<DSH_HOME>/sessions/`, multi-frame
+zstd, per call) and checks two things: whether stdout-only lines reach the model-visible text, and
+whether any single result exceeds `--cap` (8192 B by default). It is also the upgrade measurement:
+development-era sessions contain 158 results carrying the full human stdout (largest single result
+12.5 KB); the three-budget build contains none.
 
 `tools/gen-schema.mjs` needs an installed `@deepseek-ai/dsh-tools`: it looks for one under the dsh
 profile's `node_modules` and under the npm global prefix, and `DSH_TOOLS_ENTRY` overrides that lookup.
@@ -203,6 +242,8 @@ cordis.patch.yml         # host-plane bundle patch
 tools/selftest.mjs       # end-to-end self-test (core + plugin layer)
 tools/check-license.mjs  # license / dependency / Node-only hygiene gate
 tools/gen-schema.mjs     # authoritative source and checker for the embedded JSON Schemas
+tools/measure-context.mjs  # per-scenario model-visible bytes (synthetic scenarios)
+tools/audit-session.mjs  # reconciliation against real session logs + stdout leak check
 ```
 
 Backups and the ledger use fixed, documented names and fields: one file per edit under

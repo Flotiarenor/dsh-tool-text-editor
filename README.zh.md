@@ -45,8 +45,8 @@ node scripts/install-preset.mjs
 
 ### 方式二：安装到 profile（所有会话可用）
 
-`dsh plugin add` 支持多种来源，**以下来源均受支持**：本包为预构建的零依赖 ESM，无
-`prepare` / `build` 步骤，因此既无需用户授权构建，安装时也不会执行任何构建脚本。
+本包为预构建的零依赖 ESM，无 `prepare` / `build` 步骤：安装时不执行任何构建脚本，也不需要授权构建。
+下列来源均受支持：
 
 | 来源           | 命令                                                                        |
 | -------------- | --------------------------------------------------------------------------- |
@@ -103,7 +103,7 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | `path`              | 调用方给出的目标路径（原样回填）                                         | —                |
 | `ok` / `wrote` / `dryRun` | 执行结果标志                                                       | —                |
 | `brief`             | 警告行与一行统计，如 `replace@60 +1/-1`                              | 模型上下文       |
-| `diff`              | 只含 `@@` 块头与改动行的 unified diff（0 上下文行、无 `---` / `+++` 文件头），受 `maxDiffLines` 限制 | 模型上下文       |
+| `diff`              | 只含 `@@` 块头与改动行的 unified diff（0 上下文行、无 `---` / `+++` 文件头），受**行数 + 字节 + 单行字符数**三重预算约束 | 模型上下文       |
 | `stdout`            | 人读全文：路径头、含上下文行的完整 diff、备份文件名                      | UI / 日志 / 排查 |
 | `stderr`            | 失败原因（失败时非空）                                                   | 模型上下文       |
 
@@ -112,20 +112,31 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 `{ path, oldText, newText }` 列表，与原生 `edit` / `write` 的卡片词汇同形，由 `presentResult` 交给
 Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 
-失败时不返回 `brief` 与 `diff`：模型可见文本为 `FAIL` 加目标路径，其后是完整的失败原因；原因文本由
-核心生成，其中通常再包含一次工作区相对路径（失败路径优先保证原因完整）。
+失败时不返回 `brief` 与 `diff`：模型可见文本为 `FAIL` 加目标路径，其后是完整的失败原因（由核心生成，
+通常再含一次工作区相对路径）。系统调用失败只报 errno 与一句原因（`ENOENT`、`ENOTDIR`、`EISDIR`、
+`EACCES` 等）：Node 原始 message 中的绝对路径与内部临时文件名（`.<名字>.<pid><ts>.tmp`）不进入模型上下文。
 
 `diff` 参数决定 `diff` 字段的详细程度：
 
 | 取值      | 行为                                                                             |
 | --------- | -------------------------------------------------------------------------------- |
-| `auto`  | 默认。正文不超过 `maxDiffLines` 行时给出；超出时不给出正文，附一行省略提示       |
-| `full`  | 始终给出正文；超过 `maxDiffLines` 行时截断，附一行截断提示                       |
+| `auto`  | 默认。正文在三重预算内时给出；超出时不给出正文，附一行省略提示                   |
+| `full`  | 始终给出正文；超出预算时截断，附一行截断提示                                     |
 | `none`  | 不给出正文                                                                       |
 
-正文固定使用 0 上下文行；`context` 配置只影响 `stdout` 与 UI 卡片。`maxDiffLines` 的作用是限制单次
-调用回吐到模型上下文的字节数——工具结果按追加方式进入会话历史，不参与前缀缓存，因此不含上限时，
-整文件重写会产生与输入内容等量级的回吐（实测放大率 ≈ 1.0x）。
+正文固定使用 0 上下文行；`context` 配置只影响 `stdout` 与 UI 卡片。三重预算限制单次调用进入模型上下文的
+字节数：工具结果按追加方式进入会话历史，不参与前缀缓存，无上限时整文件重写的返回量与输入量同阶
+（实测 ≈ 1.0x）。
+
+| 预算              | 默认   | 约束对象                                                     |
+| ----------------- | ------ | ------------------------------------------------------------ |
+| `maxDiffLines`  | `30`   | 行数                                                         |
+| `maxDiffBytes`  | `4096` | 字节数；行长很大时行数预算失效，由它兜底                     |
+| `maxDiffLineChars` | `200` | 单行字符数；超出部分截断为 `…[+N chars]`，保留行首标识       |
+
+仅约束行数时，行数少于 30 而单行很长的改动（压缩为单行的文件、宽数据行、替换一行超长文本）仍会整篇
+进入上下文（放大率 1.0x，替换长行时约 2.0x）。三重预算下 `tools/measure-context.mjs` 实测最坏单条结果
+2.2 KB（200 行重写 + `diff:"full"`），长行场景 200–550 B。
 
 ## 已知限制
 
@@ -141,6 +152,10 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
   但另一个 dsh 实例、编辑器或其它进程同时修改同一文件时，仍可能相互覆盖，本插件也不检测外部改动。
 - **仅处理 UTF-8 文本。** 含 NUL 字节的二进制文件与非法 UTF-8 文件一律拒绝；`.git/`、`.dsh/` 内部
   以及工作区之外的路径一律拒绝写入。
+- **新建文件会补齐缺失的父目录。** `write_text` 目标不存在时按 `mkdir -p` 补齐父目录（与原生 `write`
+  一致）；该动作只在 `stdout` 留一行提示，不进入模型可见文本，`dry_run` 不创建任何目录。
+- **台账失败不改变写入结果。** 目标文件写入成功后，台账等旁路产物失败只在 `stdout` 留一行 `[note]`，
+  结果仍为 `ok`；否则调用方会重试，导致同一次编辑写入两次。
 
 ## 配置
 
@@ -155,6 +170,8 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 | `context`      | `3`             | `stdout` 与 UI 卡片中 diff 的上下文行数（模型可见正文固定 0 行） |
 | `diff`         | `'auto'`        | `diff` 字段的默认策略（`auto` / `full` / `none`）；逐调用的 `diff` 参数优先 |
 | `maxDiffLines` | `30`            | `diff` 字段的行数上限：`auto` 超出时不给出正文，`full` 超出时截断 |
+| `maxDiffBytes` | `4096`          | `diff` 字段的字节上限（行数合规但行长很大时的兜底） |
+| `maxDiffLineChars` | `200`       | `diff` 单行字符上限：超出的行截断并加 `…[+N chars]` 标注 |
 | `root`         | `process.cwd()` | 无 agent 会话时的回退工作区                      |
 
 环境变量 `DSH_TEXT_EDITOR_EOL`（`lf` \| `crlf`）可覆盖**新建文件**的行尾推断。
@@ -163,17 +180,31 @@ Web UI；该元数据随 `tool/result` 持久化，不进入模型上下文。
 
 ```powershell
 # 在本仓库根目录执行
-node tools/selftest.mjs        # Windows + Node 24 参考结果 92/92
-node tools/check-license.mjs   # 许可证 / 依赖 / 纯 Node 门禁
-node tools/gen-schema.mjs      # 内嵌 schema 是否仍与作者 DSL 一致
+node tools/selftest.mjs                 # Windows + Node 24 参考结果 107/107
+node tools/check-license.mjs            # 许可证 / 依赖 / 纯 Node 门禁
+node tools/gen-schema.mjs               # 内嵌 schema 是否仍与作者 DSL 一致
+node tools/measure-context.mjs          # 逐场景量模型可见字节（构造场景）
+node tools/audit-session.mjs            # 用真实会话日志对账（含 stdout 泄漏检查）
 ```
 
 `tools/selftest.mjs` 覆盖：BOM 与行尾保真、`dry_run`、四种锚点、`count`、歧义时拒绝写入、用法错误、
 二进制与非法 UTF-8、路径护栏（`.dsh/`、工作区之外）、行尾多数派推断、跨多个 hunk、末尾换行差异、
-并发写入不产生半截文件；**并含一层插件层断言**：以模拟 ctx 驱动 `apply()`，验证工具注册、引导段
-身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 输出，以及 config 透传（`root` / `backup` /
-`ledger` / `newFileBom`）；**以及一层返回值约束断言**：整文件重写不回显内容、小改动仍给出改动行、
+并发写入不产生半截文件、新建时补齐父目录、系统调用失败只报 errno；**并含一层插件层断言**：以模拟 ctx
+驱动 `apply()`，验证工具注册、引导段身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 输出，以及
+config 透传（`root` / `backup` / `ledger` / `newFileBom` / `maxDiffBytes` / `maxDiffLineChars`）；
+**以及一层返回值约束断言**：整文件重写不回显内容、长行被截断、宽文件不整篇回显、小改动仍给出改动行、
 `diff` 三种取值的行为边界、路径仅出现一次、完整 diff 只经 `presentationMeta` 投影。
+
+### 上下文开销的测量
+
+`tools/measure-context.mjs` 以模拟 ctx 驱动 `apply()`，走真实的 `execute()` → `output.render()` 路径，
+逐场景输出入参字节、模型可见字节、倍率与 UI 元数据字节。`--cap N`：任一场景超过 N 字节即退出码 1
+（`npm test` 使用 `--cap 4096`）。`--static` 输出每请求的静态开销；`--vs-native` 追加宿主 `write` /
+`edit` 的同一组数据（未找到 dsh 安装时输出 SKIP）。
+
+`tools/audit-session.mjs` 以真实会话日志（`<DSH_HOME>/sessions/`，分帧 zstd，按调用对账）核对两项：
+stdout 专用行是否进入模型可见文本、单条结果是否超过 `--cap`（默认 8192 B）。仓库开发期会话中 158 条
+结果含完整 stdout（单条最大 12.5 KB），三重预算实现为 0 条。
 
 `tools/gen-schema.mjs` 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：它会在 dsh profile 的
 `node_modules` 与 npm 全局目录中自动查找，也可用 `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码为 2。
@@ -189,6 +220,8 @@ cordis.patch.yml         # 宿主平面安装用的 bundle patch
 tools/selftest.mjs       # 端到端自测（核心 + 插件层）
 tools/check-license.mjs  # 许可证 / 依赖 / 纯 Node 卫生门禁
 tools/gen-schema.mjs     # 内嵌 schema 的权威来源与校验器
+tools/measure-context.mjs  # 模型可见字节的逐场景测量（构造场景）
+tools/audit-session.mjs  # 真实会话日志的上下文对账 + stdout 泄漏检查
 ```
 
 备份与台账采用固定的命名与字段：每次编辑在 `.dsh/backups/` 下留存一个文件，命名为
