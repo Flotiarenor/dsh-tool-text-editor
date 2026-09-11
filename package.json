@@ -1,7 +1,7 @@
 {
   "name": "@flotiarenor/dsh-tool-text-editor",
-  "version": "1.1.0",
-  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness: they preserve a UTF-8 BOM and the file's own CRLF/LF style (the built-in write/edit tools do not), back the previous content up, accept grep/lines anchors, and return a token-budgeted result (one stat line plus a bounded diff body, with the full diff going to the UI card instead of the model context). Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
+  "version": "1.1.1",
+  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness: they preserve a UTF-8 BOM and the file's own CRLF/LF style (the built-in write/edit tools do not), back the previous content up, accept grep/lines anchors, and return a bounded result: one stat line plus a diff body limited by maxDiffLines, while the complete diff is projected to the UI card and never enters the model context. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
   "type": "module",
   "main": "lib/editor.mjs",
   "exports": {
