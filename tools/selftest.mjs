@@ -9,9 +9,9 @@
  *   * 插件层 —— 用假 ctx 走一遍 `lib/editor.mjs` 的 `apply()`：工具注册、引导段、参数校验、
  *     **返回值与 `OUTPUT_SCHEMA` 一致**、`render()` 文本、以及 config（root/backup/ledger/newFileBom）
  *     的透传。这一层是宿主真正调用的入口，必须被测到，否则 schema 与返回值脱节也只能等线上发现；
- *   * 回吐预算 —— 模型可见文本的**大小**本身是被测对象：整体重写不许把内容原样回吐、小改动仍给
- *     改动行、`diff: none/full` 各自的边界、以及完整 diff 只走 UI 卡片。token 预算是设计约束，
- *     不是实现细节，所以它要有回归测试（否则一次"顺手打印多一点"就能悄悄把它取消掉）。
+ *   * 返回值约束 —— 模型可见文本的构成本身是被断言对象：整文件重写不得回显内容、小改动仍须
+ *     给出改动行、`diff` 三种取值各自的行为边界、路径仅出现一次，以及完整 diff 只经
+ *     `presentationMeta` 投影。这些是工具契约的一部分，因此需要回归测试。
  *
  * 实现全部是进程内 Node（不启动子进程、无外部运行时），所以自测本身也只依赖 Node。
  *
@@ -365,13 +365,14 @@ async function pluginSuite() {
 }
 
 /**
- * 回吐预算：模型可见文本的**大小**就是被测对象。
+ * 返回值约束：模型可见文本的构成与 `diff` 取值边界。
  *
- * 这些断言全部来自实测的浪费来源：整体重写把内容原样回吐（放大率 ≈1.0x）、路径在一条结果里
- * 重复五次、备份的扁平化绝对路径名混进模型上下文、`diff: full` 没有封顶。
+ * 断言依据来自实测：整文件重写的 unified diff 每一行都带 `+`，回吐量与输入内容同量级
+ * （放大率 ≈ 1.0x）；旧实现的单条结果里路径重复出现五次、备份的扁平化绝对路径名也进入模型
+ * 上下文；且 `diff: full` 没有行数上限。
  */
-async function budgetSuite() {
-  const ws = makeWorkspace('dsh-selftest-budget-')
+async function resultTextSuite() {
+  const ws = makeWorkspace('dsh-selftest-result-')
   const registered = []
   apply(
     { systemPrompt: { section: () => {} }, tools: { register: (value) => registered.push(value) } },
@@ -386,46 +387,46 @@ async function budgetSuite() {
   const big = Array.from({ length: 60 }, (_, i) => `line ${i + 1} of the big file`).join('\n') + '\n'
   const bigLines = big.trimEnd().split('\n')
 
-  // 1) 整体重写 / 新建：不许把刚发出去的内容再发回来
+  // 1) 整文件重写与新建：模型可见文本不得回显文件内容
   const created = await writeTool.execute({ file_path: 'big.txt', content: big }, exec)
   const createdText = textOf(writeTool, created)
   check(
-    'budget: a large write does not echo the content back',
+    'result: a large write does not echo the content back',
     !createdText.includes('line 30 of the big file') && createdText.includes('[diff omitted'),
     createdText,
   )
-  check('budget: that result is a stat line plus the hint, nothing else', createdText.split('\n').length === 3, JSON.stringify(createdText))
-  check('budget: stdout still carries the full human diff', created.stdout.includes('@@') && created.stdout.includes('+line 30 of the big file'))
-  check('budget: the path appears exactly once in the rendered text', createdText.split('big.txt').length - 1 === 1, createdText)
+  check('result: that result is a stat line plus the hint, nothing else', createdText.split('\n').length === 3, JSON.stringify(createdText))
+  check('result: stdout still carries the full human diff', created.stdout.includes('@@') && created.stdout.includes('+line 30 of the big file'))
+  check('result: the path appears exactly once in the rendered text', createdText.split('big.txt').length - 1 === 1, createdText)
 
-  // 2) 小改动仍然给改动行：模型要能自检"改对了没有"
+  // 2) 小改动：仍须给出改动行，以便调用方核对
   writeSample(join(ws, 'small.txt'), ['alpha', 'beta', 'gamma'])
   const small = await editTool.execute({ file_path: 'small.txt', grep: '^beta', new_text: 'BETA\n' }, exec)
   const smallText = textOf(editTool, small)
-  check('budget: a small edit still shows the changed lines', smallText.includes('-beta') && smallText.includes('+BETA'), smallText)
-  check('budget: the model-facing diff carries no context lines', !smallText.includes(' alpha'), smallText)
-  check('budget: the rendered text no longer carries the backup name', !smallText.includes('备份'), smallText)
+  check('result: a small edit still shows the changed lines', smallText.includes('-beta') && smallText.includes('+BETA'), smallText)
+  check('result: the model-facing diff carries no context lines', !smallText.includes(' alpha'), smallText)
+  check('result: the rendered text no longer carries the backup name', !smallText.includes('备份'), smallText)
 
   // 3) diff: none —— 只留统计行
   const silent = await editTool.execute({ file_path: 'small.txt', grep: '^BETA', new_text: 'beta\n', diff: 'none' }, exec)
   check(
-    'budget: diff:none keeps only the stat line',
+    'result: diff:none keeps only the stat line',
     textOf(editTool, silent) === 'WROTE small.txt\nreplace@2 +1/-1',
     textOf(editTool, silent),
   )
 
-  // 4) diff: full —— 强制给正文，但仍然封顶
+  // 4) diff: full：始终给出正文，仍受上限约束
   const rewrite = bigLines.map((line) => 'X' + line).join('\n') + '\n'
   const capped = await writeTool.execute({ file_path: 'big.txt', content: rewrite, diff: 'full' }, exec)
   const cappedText = textOf(writeTool, capped)
   check(
-    'budget: diff:full still stops at maxDiffLines',
+    'result: diff:full still stops at maxDiffLines',
     cappedText.includes('[diff truncated:') && cappedText.split('\n').length <= 33,
     `lines=${cappedText.split('\n').length}\n${cappedText}`,
   )
   const raised = await editTool.execute({ file_path: 'small.txt', grep: '^beta', new_text: 'BETA\n', diff: 'full' }, exec)
   check(
-    'budget: diff:full returns the whole diff when it fits the budget',
+    'result: diff:full returns the whole diff when it fits the budget',
     textOf(editTool, raised).includes('-beta') && textOf(editTool, raised).includes('+BETA') && !textOf(editTool, raised).includes('truncated'),
     textOf(editTool, raised),
   )
@@ -433,22 +434,22 @@ async function budgetSuite() {
   // 5) 完整 diff（含上下文行）只走 UI 卡片那条路径
   const uiMeta = writeTool.output.presentationMeta({}, created)
   check(
-    'budget: presentationMeta keeps the whole new file for the UI (pure insertion uses oldText null)',
+    'result: presentationMeta keeps the whole new file for the UI (pure insertion uses oldText null)',
     uiMeta.diffs.length === 1 && uiMeta.diffs[0].oldText === null && uiMeta.diffs[0].newText === big.trimEnd(),
     JSON.stringify(uiMeta.diffs).slice(0, 200),
   )
   const editMeta = editTool.output.presentationMeta({}, small)
   check(
-    'budget: presentationMeta keeps context lines for the UI on an edit',
+    'result: presentationMeta keeps context lines for the UI on an edit',
     editMeta.diffs.length === 1 && editMeta.diffs[0].path === 'small.txt'
       && editMeta.diffs[0].oldText.includes('beta') && editMeta.diffs[0].newText.includes('BETA'),
     JSON.stringify(editMeta.diffs),
   )
   const card = writeTool.presentResult({}, { isError: false, meta: uiMeta })
-  check('budget: presentResult hands that card to the UI', card !== undefined && card.card === 'diff', JSON.stringify(card))
+  check('result: presentResult hands that card to the UI', card !== undefined && card.card === 'diff', JSON.stringify(card))
   const dryMeta = writeTool.output.presentationMeta({}, { ok: true, wrote: false, dryRun: true, stdout: '', path: 'x' })
-  check('budget: a dry run offers no diff card (nothing was applied)', writeTool.presentResult({}, { isError: false, meta: dryMeta }) === undefined)
-  check('budget: a failed call offers no diff card', writeTool.presentResult({}, { isError: true, meta: uiMeta }) === undefined)
+  check('result: a dry run offers no diff card (nothing was applied)', writeTool.presentResult({}, { isError: false, meta: dryMeta }) === undefined)
+  check('result: a failed call offers no diff card', writeTool.presentResult({}, { isError: true, meta: uiMeta }) === undefined)
 
   rmSync(ws, { recursive: true, force: true })
 }
@@ -513,8 +514,8 @@ console.log('── plugin: apply / execute / render / config ──')
 await pluginSuite()
 
 console.log('')
-console.log('── plugin: token budget of the model-facing result ──')
-await budgetSuite()
+console.log('── plugin: model-facing result text ──')
+await resultTextSuite()
 
 console.log('')
 console.log('── usage errors ──')

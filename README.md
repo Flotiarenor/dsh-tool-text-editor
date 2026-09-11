@@ -17,9 +17,10 @@ byte by default) and `writeText` does not restore a file's line-ending style.
 
 On top of fidelity: **unified diffs** (with a `dry_run` preview), **automatic backups**, an **edit
 ledger**, **`grep` / `lines` anchors** so old text never has to be copied by hand, **ambiguity
-refusal**, **near-miss candidates** when an anchor does not match, and a **token-budgeted result
-text**: the model sees one stat line plus a line-budgeted diff body, while the full diff goes to the
-UI card (see "Result text and the token budget").
+refusal**, and **near-miss candidates** when an anchor does not match.
+
+The canonical return value of both tools, the composition of the model-facing text, and the UI card
+projection are documented under "Return value".
 
 ## Implementation and requirements
 
@@ -92,23 +93,37 @@ siblings (same extension first) with no BOM by default.
 
 Both **write by default** (like the built-ins); pass `dry_run: true` to preview.
 
-### Result text and the token budget
+### Return value
 
-Tool results land in the **append-only session history, which is never prefix-cached**, so every byte
-returned per call accumulates. The result is therefore split into layers:
+Both tools return the same canonical value (`OUTPUT_SCHEMA`). Field contents and destinations:
 
-| Layer | Content | Where it goes |
+| Field | Content | Destination |
 |---|---|---|
-| Model-facing (`brief` / `diff`) | warnings + one stat line (e.g. `replace@60 +1/-1`) + a budgeted diff body (0 context lines) | the model context |
-| Full record (`stdout`) | path header, the complete diff with context lines, the backup name | UI / logs / human triage |
-| UI card (`presentationMeta`) | the same `{ path, oldText, newText }` hunk list the built-in `edit` / `write` project | the Web UI, never the model context |
+| `path` | the target path as supplied by the caller, echoed back | — |
+| `ok` / `wrote` / `dryRun` | outcome flags | — |
+| `brief` | warning lines plus one stat line, e.g. `replace@60 +1/-1` | model context |
+| `diff` | a unified diff of the changed lines only (0 context lines), limited by `maxDiffLines` | model context |
+| `stdout` | the full human record: path header, complete diff with context lines, backup filename | UI / logs / triage |
+| `stderr` | failure reason (non-empty on failure) | model context |
 
-- The path appears **exactly once** in the model-facing text, and the backup filename is no longer
-  echoed (it stays in `stdout` and in the ledger).
-- The body is returned only when the change is genuinely small (`diff: auto`, threshold
-  `maxDiffLines`); otherwise the model gets the stat line plus a one-line hint and decides for itself
-  whether to `read`. `diff: full` forces the body, but **it is still capped** — uncapped, a 400-line
-  rewrite echoes 7.5k tokens straight back (a measured ~1.0x amplification of the content just sent).
+The model-facing text consists of `brief` and `diff`, with the path appearing once in the leading
+line. The complete diff is additionally projected by `output.presentationMeta` into a list of
+`{ path, oldText, newText }`, the same card vocabulary the built-in `edit` / `write` tools use, and
+handed to the Web UI by `presentResult`; that metadata is persisted with `tool/result` and never
+enters the model context.
+
+The `diff` argument selects the detail level of the `diff` field:
+
+| Value | Behavior |
+|---|---|
+| `auto` | default. The body is returned when it fits within `maxDiffLines`; otherwise it is omitted with a one-line note |
+| `full` | the body is always returned; it is truncated with a one-line note when it exceeds `maxDiffLines` |
+| `none` | no body is returned |
+
+The body always uses 0 context lines; the `context` setting affects `stdout` and the UI card only.
+`maxDiffLines` bounds the bytes returned to the model context by a single call: tool results are
+appended to the session history and are not prefix-cached, so without a bound a full-file rewrite
+produces a return of the same order as the content just sent (a measured ~1.0x amplification).
 
 ## Deliberate limitations
 
@@ -117,9 +132,9 @@ the tools.
 
 - **Writes bypass `ctx.fs`.** The file is written by the plugin itself, so the fs-observation policy
   (read-before-write, version freshness), the sandbox, `sandbox_permissions` escalation and Windows
-  DACL preservation are all skipped. The atomic write is the plugin's own (same-directory temp file +
-  fsync + rename) and the diff card comes from its own `presentationMeta` (the built-ins project the
-  `ctx.fs` `before` / `after` instead).
+  DACL preservation are all skipped. The atomic write is implemented by the plugin (same-directory
+  temp file + fsync + rename), and the diff card is projected by the plugin's `presentationMeta`
+  whereas the built-ins use the `before` / `after` returned by `ctx.fs`.
 - **Line anchors are not content-verified.** `lines` and `before` / `after <line>` locate text by line
   number alone: a wrong number does not fail, it edits somewhere else. When the anchor has to be
   verifiable, use `old_text` or `grep`.
@@ -139,9 +154,9 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 | `ledger` | `true` | append a JSONL record to `artifactsDir/edits.log` |
 | `artifactsDir` | `<workspace>/.dsh` | where backups and the ledger live |
 | `newFileBom` | `false` | write a UTF-8 BOM when creating a new file |
-| `context` | `3` | context lines in the **human-facing** diff (affects `stdout` and the UI card only; the model-facing body always uses 0) |
-| `diff` | `'auto'` | default policy for the model-facing diff body; a per-call `diff` argument overrides it |
-| `maxDiffLines` | `30` | line budget for the model-facing diff body: `auto` drops it when exceeded, `full` truncates at it |
+| `context` | `3` | context lines in the diff of `stdout` and the UI card (the model-facing body always uses 0) |
+| `diff` | `'auto'` | default policy for the `diff` field (`auto` / `full` / `none`); a per-call `diff` argument takes precedence |
+| `maxDiffLines` | `30` | line limit for the `diff` field: `auto` omits the body when exceeded, `full` truncates at it |
 | `root` | `process.cwd()` | fallback workspace when a call has no agent session |
 
 `DSH_TEXT_EDITOR_EOL` (`lf` \| `crlf`) overrides the line-ending inference for **new** files.
@@ -163,11 +178,10 @@ refusal, usage errors, binary/invalid-UTF-8 refusal, `.dsh/` and outside-workspa
 EOL inference, multi-hunk diffs, end-of-file newline changes and concurrent writes — **plus a
 plugin-layer suite** that drives `apply()` with a fake context and asserts tool registration, the
 guidance section, that every returned value satisfies `OUTPUT_SCHEMA`, the `render()` text, and the
-config plumbing (`root` / `backup` / `ledger` / `newFileBom`) — **and a token-budget suite**: a
-full-file rewrite must not echo the content back, a small edit still shows the changed lines, the
-`diff: none` / `full` boundaries hold, the path appears once, and the complete diff flows only into
-the UI card. The token budget is a design constraint rather than an implementation detail, so it
-carries its own regression test; otherwise one "let me print a bit more here" quietly removes it.
+config plumbing (`root` / `backup` / `ledger` / `newFileBom`) — **and a return-value suite**: a
+full-file rewrite must not echo the content back, a small edit must still report the changed lines,
+the three `diff` values must hold their documented boundaries, the path must appear once, and the
+complete diff must be projected only through `presentationMeta`.
 
 `tools/gen-schema.mjs` needs an installed `@deepseek-ai/dsh-tools`: it looks for one under the dsh
 profile's `node_modules` and under the npm global prefix, and `DSH_TOOLS_ENTRY` overrides that lookup.
@@ -176,7 +190,7 @@ It exits 2 when it cannot find one.
 ## Layout
 
 ```
-lib/core.mjs             # the core: BOM/EOL, anchors, matching, diff (with the result budget), backups, ledger, atomic write, per-target lock
+lib/core.mjs             # the core: BOM/EOL, anchors, matching, diff, backups, ledger, atomic write, per-target lock
 lib/editor.mjs           # the plugin: schemas, validation, tool registration (zero-dep ESM, no build)
 preset/preset.yml        # preset name/description, as dsh lists it
 scripts/install-preset.mjs  # derives the user preset from the local dsh installation
