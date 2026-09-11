@@ -261,6 +261,41 @@ async function nodeOnlySuite(ws) {
     const result = await run({ file_path: 'sample.md', grep: '^one$', new_text: 'ONE\n', dry_run: true })
     check('a no-change edit is refused', !result.ok || result.stdout.includes('ONE'), result.stdout + result.stderr)
   }
+  {
+    // 新建时补齐缺失的父目录（原生 write 也这么做）；提示只落在 stdout，不进模型可见文本
+    const result = await write({ file_path: 'deep/nested/fresh.md', content: 'a\nb\n' })
+    check(
+      'write(create) fills in missing parent directories',
+      result.ok && existsSync(join(ws, 'deep', 'nested', 'fresh.md')),
+      result.stderr || JSON.stringify(result),
+    )
+    check(
+      'write(create) reports the new directory in stdout only',
+      result.stdout.includes('新建了目录') && !result.brief.includes('新建了目录'),
+      result.stdout,
+    )
+    const dry = await write({ file_path: 'no-such-dir/fresh.md', content: 'x\n', dry_run: true })
+    check('a dry run creates no directories', dry.ok && !existsSync(join(ws, 'no-such-dir')), JSON.stringify(dry))
+  }
+  {
+    // 系统调用失败：只给 errno 说法；内部临时文件名（.<名字>.<pid><ts>.tmp）绝不出现在原因里
+    mkdirSync(join(ws, 'adir'), { recursive: true })
+    const result = await run({ file_path: 'adir', grep: 'x', new_text: 'y\n' })
+    check(
+      'a directory target fails with a clean errno reason',
+      !result.ok && /EISDIR/.test(result.stderr) && !result.stderr.includes('.tmp'),
+      result.stderr,
+    )
+  }
+  {
+    writeFileSync(join(ws, 'blocker'), 'not a directory\n')
+    const result = await write({ file_path: 'blocker/child.md', content: 'x\n' })
+    check(
+      'a file in the middle of the path fails with a clean errno reason',
+      !result.ok && /ENOTDIR/.test(result.stderr) && !result.stderr.includes('.tmp'),
+      result.stderr,
+    )
+  }
 }
 
 /** 插件层：用假 ctx 走 `apply()` —— 宿主真正调用的入口（注册、校验、结果形状、render、config）。 */
@@ -434,7 +469,38 @@ async function resultTextSuite() {
     textOf(editTool, raised),
   )
 
-  // 5) 完整 diff（含上下文行）只走 UI 卡片那条路径
+  // 5) 长行：行数预算管不住的那一类（压缩后的单行文件、宽数据行）
+  const longLine = 'const blob = "' + 'x'.repeat(20000) + '"'
+  const longWrite = await writeTool.execute({ file_path: 'min.js', content: longLine + '\n' }, exec)
+  const longText = textOf(writeTool, longWrite)
+  check(
+    'result: a single 20 KB line does not come back whole',
+    !longText.includes('x'.repeat(400)) && Buffer.byteLength(longText, 'utf8') < 1200,
+    `${Buffer.byteLength(longText, 'utf8')} B\n${longText}`,
+  )
+  check('result: a clamped line says how much it dropped', /…\[\+\d+ chars\]/.test(longText), longText)
+  check(
+    'result: stdout still carries the untouched line',
+    longWrite.stdout.includes('x'.repeat(20000)),
+    `stdout bytes=${Buffer.byteLength(longWrite.stdout, 'utf8')}`,
+  )
+
+  const wide = Array.from({ length: 20 }, (_, i) => `L${i} ${'y'.repeat(5000)}`).join('\n') + '\n'
+  const wideWrite = await writeTool.execute({ file_path: 'wide.txt', content: wide }, exec)
+  const wideText = textOf(writeTool, wideWrite)
+  check(
+    'result: 20 lines x 5 KB is omitted, not echoed',
+    wideText.includes('[diff omitted') && Buffer.byteLength(wideText, 'utf8') < 512,
+    `${Buffer.byteLength(wideText, 'utf8')} B\n${wideText}`,
+  )
+  const wideFull = await writeTool.execute({ file_path: 'wide2.txt', content: wide, diff: 'full' }, exec)
+  check(
+    'result: diff:full respects the byte budget too',
+    Buffer.byteLength(wideFull.diff, 'utf8') <= 4096 && wideFull.diff.includes('[diff truncated:'),
+    `${Buffer.byteLength(wideFull.diff, 'utf8')} B\n${wideFull.diff.slice(0, 300)}`,
+  )
+
+  // 6) 完整 diff（含上下文行）只走 UI 卡片那条路径
   const uiMeta = writeTool.output.presentationMeta({}, created)
   check(
     'result: presentationMeta keeps the whole new file for the UI (pure insertion uses oldText null)',
@@ -453,6 +519,22 @@ async function resultTextSuite() {
   const dryMeta = writeTool.output.presentationMeta({}, { ok: true, wrote: false, dryRun: true, stdout: '', path: 'x' })
   check('result: a dry run offers no diff card (nothing was applied)', writeTool.presentResult({}, { isError: false, meta: dryMeta }) === undefined)
   check('result: a failed call offers no diff card', writeTool.presentResult({}, { isError: true, meta: uiMeta }) === undefined)
+
+  // 7) 配置：两档新预算都能被 preset 行收紧（默认 30 行 / 4096 B / 200 字符）
+  const tightWs = makeWorkspace('dsh-selftest-budget-')
+  const tight = []
+  apply(
+    { systemPrompt: { section: () => {} }, tools: { register: (value) => tight.push(value) } },
+    { root: tightWs, maxDiffBytes: 120, maxDiffLineChars: 10 },
+  )
+  const tightWrite = tight.find((tool) => tool.name === 'write_text')
+  const tightTextOf = (result) => tightWrite.output.render({}, result)[0].text
+  const manyShort = Array.from({ length: 12 }, () => 'aaaaaaaaaa').join('\n') + '\n'
+  const overBytes = tightTextOf(await tightWrite.execute({ file_path: 'bytes.txt', content: manyShort }, {}))
+  check('config: maxDiffBytes is honoured', overBytes.includes('[diff omitted'), overBytes)
+  const oneLong = tightTextOf(await tightWrite.execute({ file_path: 'chars.txt', content: 'a'.repeat(30) + '\n' }, {}))
+  check('config: maxDiffLineChars is honoured', /…\[\+\d+ chars\]/.test(oneLong), oneLong)
+  rmSync(tightWs, { recursive: true, force: true })
 
   rmSync(ws, { recursive: true, force: true })
 }
