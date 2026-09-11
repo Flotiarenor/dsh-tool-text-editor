@@ -27,6 +27,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { apply as applyMask } from '../lib/mask.mjs'
+
 import { applyPlan } from '../lib/core.mjs'
 import { OUTPUT_SCHEMA, apply, planEdit, planWrite } from '../lib/editor.mjs'
 
@@ -646,6 +648,155 @@ async function policySuite() {
   rmSync(ws, { recursive: true, force: true })
 }
 
+/**
+ * 门禁层（`lib/mask.mjs`）：把原生 `write` / `edit` 从 agent 的可见面去掉。
+ *
+ * 这一层用假 ctx 驱动：真正的作用域语义（同一套可见性解析器同时决定 schema、查找与派发）由
+ * `tools/probe-mask.mjs` 拿真实的 `dsh-tools` + `dsh-scope` 验证，这里钉住的是本模块自己的行为——
+ * 只点名看得见的名字、两种模式各自调用什么、空段与顺序、重复事件不重复注册、以及**绝不抛异常**
+ * （监听器跑在 `agent/created` 的同步派发里，抛出会连带影响 agent 创建）。
+ */
+function maskSuite() {
+  const listeners = []
+  const ctx = { on: (event, listener) => listeners.push([event, listener]), logger: { warn: () => {} } }
+
+  /** 一个假 agent：`tools` 记录调用，`systemPrompt` 记录注册的段。 */
+  function fakeAgent(visible, opts = {}) {
+    const calls = { restrict: [], guard: [], sections: [] }
+    const tools = {
+      get: (name) => (visible.includes(name) ? { name } : undefined),
+      restrict: (filter) => calls.restrict.push(filter),
+      guard: (fn) => calls.guard.push(fn),
+    }
+    if (opts.throwingRegistry === true) tools.restrict = () => { throw new Error('registry down') }
+    const systemPrompt = { section: (section) => calls.sections.push(section) }
+    if (opts.throwingPrompt === true) systemPrompt.section = () => { throw new Error('prompt down') }
+    return { agent: { ctx: { tools, systemPrompt } }, calls }
+  }
+
+  const created = (agent) => listeners.forEach(([, listener]) => listener({ agent }))
+
+  {
+    listeners.length = 0
+    applyMask(ctx, {})
+    check(
+      'mask: subscribes to agent/created once',
+      listeners.length === 1 && listeners[0][0] === 'agent/created',
+      JSON.stringify(listeners.map(([event]) => event)),
+    )
+
+    // deny 模式：看得见的名字才点名，且只下发一次 restrict
+    const one = fakeAgent(['read', 'write', 'edit'])
+    created(one.agent)
+    check(
+      'mask: deny mode restricts exactly the visible native names',
+      one.calls.restrict.length === 1 && JSON.stringify(one.calls.restrict[0]) === '{"deny":["write","edit"]}',
+      JSON.stringify(one.calls.restrict),
+    )
+    check('mask: deny mode registers no guard', one.calls.guard.length === 0, JSON.stringify(one.calls.guard))
+    check(
+      'mask: the native guidance sections are shadowed with empty text',
+      one.calls.sections.length === 2
+        && one.calls.sections.map((section) => section.name).join(',') === 'tool:write,tool:edit'
+        && one.calls.sections.every((section) => section.text === '') === true
+        && one.calls.sections.map((section) => section.order).join(',') === '101,102',
+      JSON.stringify(one.calls.sections),
+    )
+
+    // 预设没挂 tool-fs：一个名字都看不见时不许调用 restrict（未知名字会抛）
+    const none = fakeAgent(['read'])
+    created(none.agent)
+    check(
+      'mask: a preset without the natives is left alone',
+      none.calls.restrict.length === 0 && none.calls.sections.length === 2,
+      JSON.stringify(none.calls),
+    )
+
+    // 同一个 agent 重复收到事件（或重复派发）时不重复注册：同层重名会抛
+    created(one.agent)
+    check('mask: a repeated event does not register twice', one.calls.restrict.length === 1 && one.calls.sections.length === 2, JSON.stringify(one.calls))
+
+    // 注册表/提示词服务抛错时只记日志，不把 agent 创建带崩
+    const broken = fakeAgent(['write'], { throwingRegistry: true, throwingPrompt: true })
+    let threw = false
+    try {
+      created(broken.agent)
+    } catch {
+      threw = true
+    }
+    check('mask: a failing registry or prompt service never throws out of the listener', threw === false)
+  }
+
+  {
+    // guard 模式：工具保持可见，调用被否决，原因指向我们的工具
+    listeners.length = 0
+    applyMask(ctx, { mode: 'guard' })
+    const seen = fakeAgent(['read', 'write', 'edit'])
+    created(seen.agent)
+    check('mask: guard mode registers no restriction', seen.calls.restrict.length === 0, JSON.stringify(seen.calls.restrict))
+    check('mask: guard mode registers one guard', seen.calls.guard.length === 1, JSON.stringify(seen.calls.guard.length))
+    const guard = seen.calls.guard[0]
+    check(
+      'mask: the guard denies only the native names, with an actionable reason',
+      typeof guard({ name: 'edit' }) === 'string'
+        && /edit_text/.test(guard({ name: 'edit' }))
+        && /write_text/.test(guard({ name: 'write' }))
+        && guard({ name: 'edit_text' }) === undefined
+        && guard({ name: 'read' }) === undefined,
+      JSON.stringify([guard({ name: 'edit' }), guard({ name: 'edit_text' })]),
+    )
+  }
+
+  {
+    // 配置：自定义名字、关掉段遮蔽
+    listeners.length = 0
+    applyMask(ctx, { deny: ['str_replace'], sections: [] })
+    const custom = fakeAgent(['read', 'str_replace'])
+    created(custom.agent)
+    check(
+      'mask: deny and sections are configurable',
+      JSON.stringify(custom.calls.restrict[0]) === '{"deny":["str_replace"]}' && custom.calls.sections.length === 0,
+      JSON.stringify(custom.calls),
+    )
+  }
+}
+
+/**
+ * 引导段的三档：`full`（默认，含"优先于原生"）、`short`（原生已被门禁屏蔽时用）、`false`（不注册）。
+ */
+function guidanceSuite() {
+  const sectionsOf = (config) => {
+    const sections = []
+    apply({ systemPrompt: { section: (section) => sections.push(section) }, tools: { register: () => {} } }, config)
+    return sections
+  }
+  const ws = makeWorkspace('dsh-selftest-guidance-')
+
+  const full = sectionsOf({ root: ws })
+  const short = sectionsOf({ root: ws, guidance: 'short' })
+  const none = sectionsOf({ root: ws, guidance: false })
+  check(
+    'guidance: the default is the full text that names the built-ins',
+    full.length === 1 && full[0].name === 'tool:edit_text' && full[0].order === 116 && /built-in/.test(full[0].text),
+    JSON.stringify(full[0]),
+  )
+  check(
+    'guidance: short drops the "prefer over the built-in" half and stays smaller',
+    short.length === 1 && !/built-in/.test(short[0].text) && Buffer.byteLength(short[0].text, 'utf8') < Buffer.byteLength(full[0].text, 'utf8'),
+    `${Buffer.byteLength(full[0].text, 'utf8')} B -> ${Buffer.byteLength(short[0].text, 'utf8')} B`,
+  )
+  check('guidance: false registers no section at all', none.length === 0, JSON.stringify(none))
+  let rejected = false
+  try {
+    sectionsOf({ root: ws, guidance: 'medium' })
+  } catch {
+    rejected = true
+  }
+  check('guidance: an unknown value fails the mount loudly', rejected)
+
+  rmSync(ws, { recursive: true, force: true })
+}
+
 /** 用法错误只依赖参数校验，跑一遍即可。 */
 function usageSuite() {
   const editCases = [
@@ -715,6 +866,14 @@ await presentationSuite()
 console.log('')
 console.log('── plugin: session file policy (read-only refusal) ──')
 await policySuite()
+
+console.log('')
+console.log('── mask: hiding the built-in write/edit ──')
+maskSuite()
+
+console.log('')
+console.log('── guidance: full / short / off ──')
+guidanceSuite()
 
 console.log('')
 console.log('── usage errors ──')

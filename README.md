@@ -71,6 +71,62 @@ that both tools (and their guidance section) show up in **every** session. Unins
 
 Both installs may coexist: the preset layer shadows the host layer with an identical definition.
 
+## Masking the built-in `write` / `edit` (optional)
+
+`lib/mask.mjs` is a separate plugin row: install it into a preset and that preset's sessions have no
+built-in `write` / `edit` at all. The installer takes a flag:
+
+```powershell
+node scripts/install-preset.mjs --mask-native     # adds the tool-native-edit-mask row and writes guidance: short
+```
+
+It removes **2362 B per request** (measured by `node tools/measure-context.mjs --vs-native`): the two
+schemas (1754 B: `write` 728 + `edit` 1026, sandbox escalation fields included) plus their two guidance
+sections (608 B: 220 + 388). Switching the editor row to `guidance: short` removes another 81 B
+(241 -> 160), for **2443 B per request** in total (~600 tokens).
+
+It works through two channels, both scoped to each agent:
+
+| Channel | Call | Effect |
+| --- | --- | --- |
+| Tool catalog and execution | `agent.ctx.tools.restrict({ deny: ['write','edit'] })` | The named tools are **gone from the catalog and uncallable** - naming one yields `UNKNOWN_TOOL` |
+| Prompt | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` | An empty same-named section in a nearer layer shadows the two sections `dsh-tool-fs` registers |
+
+Why it hangs off `agent/created`: `restrict()` may only be called from a **scoped context**; called from
+the preset's standing scope (the plugin row's own context) it is refused, because names registered in
+that same layer are not restrictable globals. Scope routing guarantees a listener registered in this
+row's scope only sees agents that joined this preset (subagent children included, since they parent to
+the same standing key).
+
+### Can the built-ins still be tested once masked? Yes - four ways
+
+1. **Use another preset.** The mask only affects the preset that carries it; a `standard` session keeps
+   both tools visible and callable - the built-in control group that `tools/probe-mask.mjs` asserts.
+2. **Run the probe.** `node tools/probe-mask.mjs` rebuilds the mount shape with the real `dsh-tools` +
+   `dsh-scope` and asserts visibility, executability and the prompt text; 11 checks, exit code 2 when no
+   dsh installation is found.
+3. **Drive the built-ins directly.** `tools/measure-context.mjs --vs-native` calls `apply()` on the real
+   `dsh-tool-fs` inside the process and measures its schemas and sections - no agent involved, so no
+   mask can reach it.
+4. **Lift it temporarily.** Give the `tool-native-edit-mask` row `disabled: true`, or switch it to
+   `mode: 'guard'`.
+
+### `mode: 'guard'`: keep a window open
+
+`mode: 'guard'` skips `restrict` and registers `agent.ctx.tools.guard(...)` instead: the tools stay
+**visible**, calls are refused with a reason naming `edit_text` / `write_text`. The schemas and guidance
+sections are still paid for (that 2362 B), and in exchange the built-ins stay callable and observable.
+
+### Boundaries
+
+- **Not an authority boundary.** This is the live visibility composition DSH documents: the built-ins
+  **stay registered** (a plugin/tool inventory may still list them) and a shell command can still write
+  files. `tools/probe-mask.mjs` asserts exactly that.
+- **Names are configuration.** `deny` / `sections` are config, so a rename or split of `tool-fs` is a
+  config edit.
+- **Only visible names are named.** A preset without `tool-fs` gets no restriction at all (never an
+  unknown-name error); the section shadowing still applies.
+
 ## Tools
 
 ### `edit_text` — targeted replacement
@@ -202,6 +258,7 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 | `ledger` | `true` | append a JSONL record to `artifactsDir/edits.log` |
 | `artifactsDir` | `<workspace>/.dsh` | where backups and the ledger live |
 | `newFileBom` | `false` | write a UTF-8 BOM when creating a new file |
+| `guidance` | `'full'` | three modes: `full` (names the built-ins) / `short` (for when the mask hides them) / `false` (register no section) |
 | `root` | `process.cwd()` | fallback workspace when a call has no agent session |
 
 `DSH_TEXT_EDITOR_EOL` (`lf` \| `crlf`) overrides the line-ending inference for **new** files.
@@ -210,11 +267,12 @@ There is no Config schema: the preset row's `config:` mapping is passed through 
 
 ```powershell
 # run from the root of a clone of this repository
-node tools/selftest.mjs                 # 105/105 on Windows + Node 24
+node tools/selftest.mjs                 # 120/120 on Windows + Node 24
 node tools/check-license.mjs            # license / dependency / Node-only gate
 node tools/gen-schema.mjs               # embedded schemas still match the DSL
 node tools/measure-context.mjs          # per-scenario model-visible bytes
 node tools/audit-session.mjs            # reconcile against real session logs (text-shape check)
+node tools/probe-mask.mjs               # verify the mask against real dsh packages (exit 2 without them)
 ```
 
 `npm test` chains the licence gate, the self-test and `measure-context --cap 2048`: no single call may
@@ -233,9 +291,19 @@ value satisfies `OUTPUT_SCHEMA`, the literal shape of the `render()` text, and t
 (`root` / `backup` / `ledger` / `newFileBom`) — **a return-value suite**: whatever the input size, a
 successful call is two lines, carries no change content and never repeats the path — **a presentation
 suite**: `presentCall` shapes, the applied-hunk projection, replay narrowing, the degradation paths for
-absent/empty/malformed metadata, and the card cap — and **a policy suite**: `read-only` refuses both
+absent/empty/malformed metadata, and the card cap — **a policy suite**: `read-only` refuses both
 tools before any I/O (no bytes, no backup), `workspace-write` / `danger-full-access` keep writing, and a
-missing or throwing policy service does not brick writes.
+missing or throwing policy service does not brick writes — **a mask suite**: only visible names are
+named, what each mode calls, the empty sections and their orders, no double registration, and a
+throwing registry or prompt service never escaping the listener — and **a guidance suite**: the
+`full` / `short` / `false` modes plus a loud failure on an unknown value.
+
+`tools/probe-mask.mjs` rebuilds the preset mount shape with the real dsh packages (`dsh-tools` +
+`dsh-scope` + `dsh-system-prompt` + `cordis`) and asserts the mask's actual registry semantics: a masked
+agent loses `write` / `edit` from its catalog, naming one yields `UNKNOWN_TOOL`, an unmasked sibling
+keeps both, the native guidance disappears from the masked prompt only, the standing scope still has
+them registered (visibility composition, not authority), and `mode: 'guard'` keeps them visible while
+refusing the call. Exit code 2 when no dsh installation is found.
 
 ### Measuring context cost
 
@@ -258,15 +326,17 @@ It exits 2 when it cannot find one.
 ## Layout
 
 ```
-lib/core.mjs             # the core: BOM/EOL, anchors, matching, backups, ledger, atomic write, per-target lock
-lib/editor.mjs           # the plugin: schemas, validation, tool registration (zero-dep ESM, no build)
+lib/core.mjs             # the core: BOM/EOL, anchors, matching, backups, ledger, atomic write, locks, hunk projection
+lib/editor.mjs           # the plugin: schemas, validation, registration, diff card, read-only mirror (zero-dep ESM)
+lib/mask.mjs             # optional row: hide the built-in write / edit per agent (deny or guard)
 preset/preset.yml        # preset name/description, as dsh lists it
-scripts/install-preset.mjs  # derives the user preset from the local dsh installation
+scripts/install-preset.mjs  # derives the user preset from the local dsh installation (--mask-native adds the mask)
 cordis.patch.yml         # host-plane bundle patch
-tools/selftest.mjs       # end-to-end self-test (core + plugin layer)
+tools/selftest.mjs       # end-to-end self-test (core + plugin + presentation + policy + mask + guidance)
+tools/probe-mask.mjs     # verifies the mask's registry semantics against real dsh packages (exit 2 without them)
 tools/check-license.mjs  # license / dependency / Node-only hygiene gate
 tools/gen-schema.mjs     # authoritative source and checker for the embedded JSON Schemas
-tools/measure-context.mjs  # per-scenario model-visible bytes
+tools/measure-context.mjs  # per-scenario model-visible bytes + the native-tool comparison
 tools/audit-session.mjs  # reconciliation against real session logs + text-shape check
 ```
 

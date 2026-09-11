@@ -63,6 +63,55 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 
 两种方式可以并存：同名时 preset 层的注册会遮蔽宿主层的注册，二者定义相同、行为一致。
 
+## 屏蔽原生 `write` / `edit`（可选）
+
+`lib/mask.mjs` 是一行独立的插件：装进 preset 后，**该 preset 的会话里就没有原生 `write` / `edit`**。
+安装时加一个开关即可：
+
+```powershell
+node scripts/install-preset.mjs --mask-native     # 多插一行 tool-native-edit-mask，并给编辑行写 guidance: short
+```
+
+省下的是每次请求 **2362 B**（`node tools/measure-context.mjs --vs-native` 实测）：两个 schema
+1754 B（`write` 728 + `edit` 1026，含沙箱升权字段）加两段引导 608 B（220 + 388）；再把编辑行的
+`guidance` 换成 `short` 又省 81 B（241 → 160）。合计 **2443 B/请求**（约 600 token）。
+
+它做两件事，都落在**每个 agent 自己的作用域**上：
+
+| 通道 | 调用 | 效果 |
+| --- | --- | --- |
+| 工具表与执行 | `agent.ctx.tools.restrict({ deny: ['write','edit'] })` | 被拒的名字**既不出现在工具表里，也调不动**——直呼其名得到 `UNKNOWN_TOOL` |
+| 提示词 | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` | 在更近的层注册同名**空段**，遮蔽 `dsh-tool-fs` 注册的那两段引导 |
+
+为什么挂在 `agent/created` 上：`restrict()` 只能从**带作用域的上下文**调用，从 preset 常驻作用域
+（也就是插件行自己的 ctx）调用会被拒绝——同一层里注册的名字不算"可限制的全局工具"。作用域路由保证
+注册在本行作用域里的监听器只收到**加入本 preset 的 agent**（含 subagent 子 agent，它们同样父级到
+同一个常驻键）。
+
+### 屏蔽之后还能测原生工具吗？能，四条路
+
+1. **换一个 preset**：门禁只作用于装了它的那个 preset。用 `standard` 新建会话，原生工具照旧可见可用
+   ——天然的对照组（`tools/probe-mask.mjs` 就断言了这一点）。
+2. **进程内探针**：`node tools/probe-mask.mjs` 用真实的 `dsh-tools` + `dsh-scope` 复刻挂载形状，
+   断言"看得见 / 看不见、调得动 / 调不动、提示词里还有没有那两段"，11 项全过（找不到 dsh 包时退出码 2）。
+3. **直接驱动原生工具**：`tools/measure-context.mjs --vs-native` 在进程内对真实的 `dsh-tool-fs` 调
+   `apply()` 并量它的 schema 与引导段——不经过任何 agent，门禁管不着。
+4. **临时撤掉**：给 preset 里的 `tool-native-edit-mask` 行加 `disabled: true`，或改用 `mode: 'guard'`。
+
+### `mode: 'guard'`：留一条观察窗
+
+`mode: 'guard'` 不调用 `restrict`，而是 `agent.ctx.tools.guard(...)`：工具**保持可见**，调用被否决，
+拒绝原因里点名 `edit_text` / `write_text`。代价是 schema 与引导的钱照付（那 2362 B），换来的是原生
+工具仍可被调用、可观察——想一边屏蔽一边看原生行为时用它。
+
+### 边界
+
+- **不是权限边界**：这是 dsh 文档所说的 live visibility composition。原生工具**仍然注册在注册表里**
+  （GUI 的插件/工具清单可能照旧列出它们），shell 命令也一样能写文件——`tools/probe-mask.mjs` 专门
+  断言了这条。
+- **名字可配**：`deny` / `sections` 都是 config，`tool-fs` 改名或拆包时改配置即可。
+- **只点名看得见的名字**：preset 没挂 `tool-fs` 时门禁什么都不做（不会因未知名字抛错），段遮蔽照旧。
+
 ## 工具契约
 
 ### `edit_text` —— 局部替换
@@ -184,6 +233,7 @@ FAIL                    # 失败：完整原因（决定下一次调用）
 | `ledger`       | `true`          | 往 `artifactsDir/edits.log` 追加一条 JSONL 记录 |
 | `artifactsDir` | `<工作区>/.dsh` | 备份与台账所在目录                               |
 | `newFileBom`   | `false`         | 新建文件时是否写 UTF-8 BOM                       |
+| `guidance`     | `'full'`        | 引导段三档：`full`（含"优先于原生"）/ `short`（原生已被门禁屏蔽时用）/ `false`（整段不注册） |
 | `root`         | `process.cwd()` | 无 agent 会话时的回退工作区                      |
 
 环境变量 `DSH_TEXT_EDITOR_EOL`（`lf` \| `crlf`）可覆盖**新建文件**的行尾推断。
@@ -192,11 +242,12 @@ FAIL                    # 失败：完整原因（决定下一次调用）
 
 ```powershell
 # 在本仓库根目录执行
-node tools/selftest.mjs                 # Windows + Node 24 参考结果 105/105
+node tools/selftest.mjs                 # Windows + Node 24 参考结果 120/120
 node tools/check-license.mjs            # 许可证 / 依赖 / 纯 Node 门禁
 node tools/gen-schema.mjs               # 内嵌 schema 是否仍与作者 DSL 一致
 node tools/measure-context.mjs          # 逐场景量模型可见字节
 node tools/audit-session.mjs            # 用真实会话日志对账（含文本形状检查）
+node tools/probe-mask.mjs              # 用真实 dsh 包验证门禁（缺包时退出码 2）
 ```
 
 `npm test` 串起许可证门禁、自测与 `measure-context --cap 2048`；后者保证任何一次调用的模型可见文本
@@ -208,9 +259,17 @@ node tools/audit-session.mjs            # 用真实会话日志对账（含文�
 `apply()`，验证工具注册、引导段身份、每个返回值均满足 `OUTPUT_SCHEMA`、`render()` 的字面形状，以及
 config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**一层返回值约束断言**：无论输入多大，
 成功路径都只有两行、不含改动内容、也不重复路径；**一层呈现层断言**：`presentCall` 的形状、实际 hunk
-的投影、回放窄化、投影缺失/为空/畸形时的降级，以及卡片上限；**以及一层策略断言**：`read-only` 下
+的投影、回放窄化、投影缺失/为空/畸形时的降级，以及卡片上限；**一层策略断言**：`read-only` 下
 两个工具在任何 I/O 之前拒写（不留字节、不留备份），`workspace-write` / `danger-full-access` 照旧写，
-策略服务缺席或抛错不误伤写入。
+策略服务缺席或抛错不误伤写入；**一层门禁断言**：只点名本 agent 看得见的名字、两种模式各自调用什么、
+空段与顺序、重复事件不重复注册、注册表或提示词服务抛错时不把 agent 创建带崩；**以及一层引导段断言**：
+`full` / `short` / `false` 三档与非法取值报错。
+
+`tools/probe-mask.mjs` 用**真实的** dsh 包（`dsh-tools` + `dsh-scope` + `dsh-system-prompt` + `cordis`）
+复刻 presets 的挂载形状，验证门禁在注册表里的实际语义：受限 agent 的工具表里没有 `write` / `edit`、
+直呼得到 `UNKNOWN_TOOL`、未受限的兄弟 agent 照旧看得见也调得动、受限 agent 的提示词里没有原生那两段
+引导、常驻作用域仍注册着它们（可见性组合而非权限边界），以及 `mode: 'guard'` 下"可见但被拒"。缺少
+dsh 包时退出码 2。
 
 ### 上下文开销的测量
 
@@ -229,15 +288,17 @@ config 透传（`root` / `backup` / `ledger` / `newFileBom`）；**一层返回�
 ## 目录结构
 
 ```
-lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、备份、台账、原子写、同目标串行
-lib/editor.mjs           # 插件本体：schema、参数校验、工具注册（零依赖 ESM，无构建）
+lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、备份、台账、原子写、同目标串行、hunk 投影
+lib/editor.mjs           # 插件本体：schema、参数校验、工具注册、diff 卡片、read-only 镜像（零依赖 ESM，无构建）
+lib/mask.mjs             # 可选门禁行：按 agent 作用域屏蔽原生 write / edit（deny 或 guard）
 preset/preset.yml        # preset 的名字/描述（dsh 列表里显示的内容）
-scripts/install-preset.mjs  # 从本机 dsh 派生用户 preset
+scripts/install-preset.mjs  # 从本机 dsh 派生用户 preset（--mask-native 一并装门禁）
 cordis.patch.yml         # 宿主平面安装用的 bundle patch
-tools/selftest.mjs       # 端到端自测（核心 + 插件层）
+tools/selftest.mjs       # 端到端自测（核心 + 插件层 + 呈现层 + 策略层 + 门禁层 + 引导段）
+tools/probe-mask.mjs     # 用真实 dsh 包验证门禁的注册表语义（缺包时退出码 2）
 tools/check-license.mjs  # 许可证 / 依赖 / 纯 Node 卫生门禁
 tools/gen-schema.mjs     # 内嵌 schema 的权威来源与校验器
-tools/measure-context.mjs  # 模型可见字节的逐场景测量
+tools/measure-context.mjs  # 模型可见字节的逐场景测量 + 原生工具对照
 tools/audit-session.mjs  # 真实会话日志的上下文对账 + 文本形状检查
 ```
 

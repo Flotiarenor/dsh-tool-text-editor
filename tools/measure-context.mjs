@@ -136,17 +136,26 @@ const SCENARIOS = [
   })],
 ]
 
-/** 静态开销：请求里每次都带的那部分（可前缀缓存，但仍占预算）。 */
+/**
+ * 静态开销：请求里每次都带的那部分（可前缀缓存，但仍占预算）。
+ *
+ * 顺带量出引导段三档的字节数：`full`（默认，含"优先于原生"）、`short`（原生已被门禁屏蔽时用）、
+ * `off`（不注册）。
+ */
 async function staticReport() {
   const registered = []
-  let guidance = ''
-  apply(
-    {
-      systemPrompt: { section: (section) => { guidance = section.text } },
-      tools: { register: (tool) => registered.push(tool) },
-    },
-    {},
-  )
+  const guidanceOf = (config) => {
+    let text = ''
+    apply(
+      {
+        systemPrompt: { section: (section) => { text = section.text } },
+        tools: { register: (tool) => registered.push(tool) },
+      },
+      config,
+    )
+    return text
+  }
+  const guidance = guidanceOf({})
   let total = 0
   console.log('=== static overhead (sent with every request)')
   for (const [label, text] of [['system prompt section', guidance]]) {
@@ -160,7 +169,14 @@ async function staticReport() {
     console.log(`  ${String(description).padStart(6)} B  ${tool.name} description`)
     console.log(`  ${String(schema).padStart(6)} B  ${tool.name} parameter schema (${Object.keys(tool.parameters.properties).length} props)`)
   }
-  console.log(`  ${String(total).padStart(6)} B  TOTAL`)
+  console.log(`  ${String(total).padStart(6)} B  TOTAL (guidance: full)`)
+  console.log('  --- guidance variants')
+  registered.length = 0
+  const short = guidanceOf({ guidance: 'short' })
+  registered.length = 0
+  const off = guidanceOf({ guidance: false })
+  console.log(`  ${String(bytes(short)).padStart(6)} B  guidance: short   (${bytes(short) - bytes(guidance)} B)`)
+  console.log(`  ${String(bytes(off)).padStart(6)} B  guidance: false   (${bytes(off) - bytes(guidance)} B)`)
   return total
 }
 
@@ -194,9 +210,10 @@ async function nativeReport() {
   }
   const mod = await import(pathToFileURL(entry).href)
   const registered = []
+  const sections = []
   const sandboxCtx = {
     tools: { register: (tool) => registered.push(tool) },
-    systemPrompt: { section: () => {} },
+    systemPrompt: { section: (section) => sections.push(section) },
     fs: { sandboxMode: 'workspace-write' },
     emit() {},
     provide() {},
@@ -207,14 +224,21 @@ async function nativeReport() {
   }
   ;(mod.default ?? mod).apply(sandboxCtx, { readLimit: 2000, readMaxLineLength: 2000, readMaxBytes: 262144, readStreamMinSize: 4096 })
   console.log(`\n=== native tools from dsh-tool-fs (${entry})`)
-  let total = 0
+  let schemaTotal = 0
   for (const tool of registered.filter((tool) => tool.name === 'write' || tool.name === 'edit')) {
     const description = bytes(tool.description)
     const schema = bytes(JSON.stringify(tool.parameters))
-    total += description + schema
+    schemaTotal += description + schema
     console.log(`  ${tool.name.padEnd(8)} desc=${String(description).padStart(4)} B  params=${String(schema).padStart(4)} B`)
   }
-  console.log(`  native write + edit total: ${total} B`)
+  console.log(`  native write + edit schemas : ${schemaTotal} B`)
+  let sectionTotal = 0
+  for (const section of sections.filter((section) => section.name === 'tool:write' || section.name === 'tool:edit')) {
+    sectionTotal += bytes(section.text)
+    console.log(`  ${section.name.padEnd(8)} order=${String(section.order).padStart(4)}  ${String(bytes(section.text)).padStart(4)} B  guidance section`)
+  }
+  console.log(`  native write + edit sections: ${sectionTotal} B`)
+  console.log(`  => masking both (lib/mask.mjs) removes ${schemaTotal + sectionTotal} B per request`)
 }
 
 // ── 跑起来 ──────────────────────────────────────────────────────────────────

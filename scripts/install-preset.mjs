@@ -18,6 +18,11 @@
  *   node scripts/install-preset.mjs --from <path-to-agent.cordis.yml>   # 自己指定源组合
  *   node scripts/install-preset.mjs --force              # 覆盖已存在的 preset（只覆盖两个文件）
  *   node scripts/install-preset.mjs --dry-run            # 只打印会做什么，不落盘
+ *   node scripts/install-preset.mjs --mask-native        # 额外插入屏蔽原生 write/edit 的门禁行
+ *
+ * `--mask-native` 会多插一行 `tool-native-edit-mask`（`lib/mask.mjs`），并给编辑行写
+ * `guidance: short`：这个 preset 的会话里，原生 `write`/`edit` 既不出现在工具表里也调不动，
+ * 两段原生引导也被空段遮蔽（合计约 2.4 KB/请求）。其它 preset 的会话不受影响，可作对照组。
  *
  * 退出码：0 成功，1 失败，2 用法错误 / 找不到 dsh 自带的 preset 组合。
  */
@@ -30,6 +35,7 @@ import { fileURLToPath } from 'node:url'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = resolve(HERE, '..')
 const PLUGIN = join(REPO, 'lib', 'editor.mjs').replace(/\\/g, '/')
+const MASK = join(REPO, 'lib', 'mask.mjs').replace(/\\/g, '/')
 const META = join(REPO, 'preset', 'preset.yml')
 const SHIPPED_PRESET_DIR = ['config', 'agent-presets']
 const COMPOSITION = 'agent.cordis.yml'
@@ -70,8 +76,51 @@ function findCompositions(base) {
   return candidates
 }
 
-/** 我们插进组合里的那一段（只有这一段是我们自己的文字 + 行）。 */
-function pluginBlock(sourcePath) {
+/**
+ * 我们插进组合里的那一段（只有这一段是我们自己的文字 + 行）。
+ * @param sourcePath - 源组合路径（写进注释，便于升级后重跑）。
+ * @param maskNative - 是否同时插入"屏蔽原生 write/edit"的门禁行，并让编辑行改用短引导。
+ */
+function pluginBlock(sourcePath, maskNative) {
+  const editorTail = [
+    '# 可选 config（插件没有 Config schema，字段原样透传）：',
+    '#   backup / ledger: boolean   默认都 true（备份到 artifactsDir/backups，台账 artifactsDir/edits.log）',
+    '#   artifactsDir: <路径>       默认 <会话工作区>/.dsh',
+    '#   newFileBom: boolean        默认 false（新建文件是否写 BOM）',
+    '#   context: number            diff 上下文行数，默认 3',
+    '#   root: <路径>               没有 agent 会话时的回退工作区',
+    '#   guidance: full|short|false 默认 full；short 去掉"优先于原生"那半句（原生已被下面的门禁屏蔽）',
+    '- id: tool-text-editor',
+    `  name: '${PLUGIN}'`,
+    ...(maskNative
+      ? ['  config:', '    guidance: short']
+      : []),
+    '',
+  ]
+  const maskLines = maskNative
+    ? [
+      '',
+      '# ── 屏蔽原生的 write / edit（每个 agent 的作用域）──────────────────────────',
+      '#',
+      '# 原生两个工具即便有上面那对工具也仍在工具表里，每次请求要付 1754 B 的两个 schema 加 608 B 的',
+      '# 两段引导，而它们存在的唯一作用就是让模型**别**用原生工具。这一行把它按 agent 作用域收窄：',
+      '#   * `agent.ctx.tools.restrict({ deny })` —— 注册表只有一套可见性解析器，schema 下发、查找与',
+      '#     派发读同一张视图，所以被拒的名字既不出现在工具表里，也调不动（直呼得到 UNKNOWN_TOOL）；',
+      '#   * 在更近的层注册同名**空段**，遮蔽 dsh-tool-fs 注册的 tool:write / tool:edit 引导。',
+      '#',
+      '# 只影响选了本 preset 的会话：其它 preset 与 profile 层的会话里原生工具照旧可用（天然的对照组，',
+      '# 想随时观察或对比原生行为就用那边的新会话）。',
+      '#',
+      '# 只写模型看不见的名字才安全：门禁只点名"本 agent 真的看得见"的工具，preset 没挂 tool-fs 时不会',
+      '# 因未知名字抛错。`mode: guard` 可换成"工具保持可见、调用被否决"（想留观察窗时用，schema 与引导',
+      '# 的钱照付）；`sections: []` 则保留原生那两段引导文字。',
+      '#',
+      '# 回退：删掉这一行（或给编辑行加 `guidance: full` 恢复原引导段）。',
+      '- id: tool-native-edit-mask',
+      `  name: '${MASK}'`,
+      '',
+    ]
+    : []
   return [
     '# ── 字节保真的文本编辑工具（edit_text / write_text）─────────────────────────',
     '#',
@@ -89,8 +138,11 @@ function pluginBlock(sourcePath) {
     '# 实现是**进程内 Node**：零依赖、零外部运行时、每次调用没有进程启动开销（不启动任何解释器或',
     '# 外部命令）。',
     '#',
-    '# 原生 `edit`/`write` **保留不动**：本行注册的是两个**不同名**工具，同一层不会同名冲突，',
-    '# 想回退只需给这一行加 `disabled: true`（或整行删掉）。',
+    ...(maskNative
+      ? ['# 原生 `edit`/`write` 由下面的门禁行按 agent 作用域屏蔽（本行自己也就不再需要"优先于原生"那',
+        '# 半句引导，见编辑器行的 `guidance: short`）。']
+      : ['# 原生 `edit`/`write` **保留不动**：本行注册的是两个**不同名**工具，同一层不会同名冲突，',
+        '# 想回退只需给这一行加 `disabled: true`（或整行删掉）。']),
     '#',
     '# 本文件由 `scripts/install-preset.mjs` 生成：源 = 本机 dsh 自带的 preset 组合',
     `#   ${sourcePath}`,
@@ -100,15 +152,8 @@ function pluginBlock(sourcePath) {
     '#',
     '# 该插件消费宿主服务（tools / systemPrompt），不发布任何服务，因此不需要 isolate realm。',
     '#',
-    '# 可选 config（插件没有 Config schema，字段原样透传）：',
-    '#   backup / ledger: boolean   默认都 true（备份到 artifactsDir/backups，台账 artifactsDir/edits.log）',
-    '#   artifactsDir: <路径>       默认 <会话工作区>/.dsh',
-    '#   newFileBom: boolean        默认 false（新建文件是否写 BOM）',
-    '#   context: number            diff 上下文行数，默认 3',
-    '#   root: <路径>               没有 agent 会话时的回退工作区',
-    '- id: tool-text-editor',
-    `  name: '${PLUGIN}'`,
-    '',
+    ...editorTail,
+    ...maskLines,
   ].join('\n')
 }
 
@@ -123,11 +168,11 @@ const ANCHORS = [
  * @returns `{ text, anchor }`
  * @throws {Error} 源组合看起来已经打过补丁时。
  */
-function inject(source, sourcePath) {
+function inject(source, sourcePath, maskNative) {
   if (/^- id: tool-text-editor$/m.test(source)) {
     throw new Error('源组合里已经有 tool-text-editor 行了 —— 请指向 dsh 自带的原始组合')
   }
-  const block = pluginBlock(sourcePath)
+  const block = pluginBlock(sourcePath, maskNative)
   for (const { pattern, label } of ANCHORS) {
     const match = pattern.exec(source)
     if (match !== null) {
@@ -145,6 +190,7 @@ const id = flagValue('--id') ?? 'texteditor'
 const base = flagValue('--base') ?? 'standard'
 const force = process.argv.includes('--force')
 const dryRun = process.argv.includes('--dry-run')
+const maskNative = process.argv.includes('--mask-native')
 const fromFlag = flagValue('--from')
 
 if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
@@ -157,6 +203,10 @@ if (!/^[a-z0-9][a-z0-9-]*$/.test(base)) {
 }
 if (!existsSync(PLUGIN)) {
   console.error('FAIL 找不到插件文件：' + PLUGIN)
+  process.exit(1)
+}
+if (maskNative && !existsSync(MASK)) {
+  console.error('FAIL 找不到门禁文件：' + MASK + '（--mask-native 需要它）')
   process.exit(1)
 }
 if (!existsSync(META)) {
@@ -176,7 +226,7 @@ if (sourcePath === undefined) {
 const source = readFileSync(sourcePath, 'utf8')
 let injected
 try {
-  injected = inject(source, sourcePath)
+  injected = inject(source, sourcePath, maskNative)
 } catch (error) {
   console.error('FAIL ' + error.message)
   process.exit(2)
@@ -191,6 +241,7 @@ const targetMeta = join(targetDir, 'preset.yml')
 
 console.log('仓库        : ' + REPO)
 console.log('插件        : ' + PLUGIN)
+if (maskNative) console.log('门禁        : ' + MASK + '（屏蔽原生 write/edit，编辑行 guidance: short）')
 console.log('源组合      : ' + sourcePath + (fromFlag === undefined && process.env.DSH_PRESET_SOURCE === undefined ? `（--base ${base}）` : ''))
 console.log('插入位置    : ' + injected.anchor)
 console.log('DSH_HOME    : ' + dshHome)
@@ -232,5 +283,10 @@ console.log('下一步：')
 console.log('  1. 重启 dsh web（preset 名单在启动时读取；运行中的会话不会换 preset）')
 console.log('  2. 新建一个会话，preset 选 "' + id + '"')
 console.log('  3. 会话里直接用 edit_text / write_text（纯 Node 进程内实现：零依赖、零外部运行时）')
+if (maskNative) {
+  console.log('     该 preset 的会话里原生 write/edit 既不出现在工具表里、也调不动（直呼得到 UNKNOWN_TOOL）；')
+  console.log('     想对比或观察原生行为，用别的 preset（如 standard）新建会话即可 —— 门禁只作用于本 preset。')
+}
 console.log('升级 dsh 后重跑本脚本（加 --force）即可让 preset 跟上新版自带组合。')
 console.log('回退：给 ' + targetComposition + ' 里的 tool-text-editor 行加 disabled: true，或删掉 ' + targetDir)
+if (maskNative) console.log('      只想撤掉屏蔽：删掉同文件里的 tool-native-edit-mask 行，并把编辑行的 guidance 改回 full。')

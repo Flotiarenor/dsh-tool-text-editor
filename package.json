@@ -23,6 +23,7 @@
     "measure": "node tools/measure-context.mjs",
     "measure:cap": "node tools/measure-context.mjs --cap 2048",
     "measure:static": "node tools/measure-context.mjs --static --vs-native",
+    "probe:mask": "node tools/probe-mask.mjs",
     "audit": "node tools/audit-session.mjs",
     "install:preset": "node scripts/install-preset.mjs",
     "prepublishOnly": "node tools/check-license.mjs && node tools/selftest.mjs"
