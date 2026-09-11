@@ -51,7 +51,7 @@ node scripts/install-preset.mjs
 | 本地仓库       | `dsh plugin --profile web add link:<本仓库的绝对路径>`                    |
 | npm（发布后）  | `dsh plugin --profile web add @flotiarenor/dsh-tool-text-editor`          |
 | 打包的 tarball | 先 `pnpm pack`，再 `dsh plugin --profile web add ./<pnpm pack 输出的文件名>.tgz` |
-| git 仓库       | `dsh plugin --profile web add github:<owner>/dsh-tool-text-editor`        |
+| git 仓库（跟随默认分支） | `dsh plugin --profile web add github:Flotiarenor/dsh-tool-text-editor` |
 
 可在启动前用以下命令确认该层是否生效：
 

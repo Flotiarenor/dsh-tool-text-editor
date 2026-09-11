@@ -58,7 +58,7 @@ prebuilt, dependency-free ESM, so there is no `prepare`/`build` step to authoriz
 | a local checkout | `dsh plugin --profile web add link:<absolute-path-to-this-checkout>` |
 | npm, once published | `dsh plugin --profile web add @flotiarenor/dsh-tool-text-editor` |
 | a packed tarball | `pnpm pack`, then `dsh plugin --profile web add ./<the-file-it-printed>.tgz` |
-| a git repository | `dsh plugin --profile web add github:<owner>/dsh-tool-text-editor` |
+| a git repository (tracks the default branch) | `dsh plugin --profile web add github:Flotiarenor/dsh-tool-text-editor` |
 
 Verify the layer without starting anything, then restart:
 
