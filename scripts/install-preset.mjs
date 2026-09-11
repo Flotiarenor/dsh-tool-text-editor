@@ -41,7 +41,7 @@ function flagValue(name) {
   if (index < 0) return undefined
   const value = process.argv[index + 1]
   if (value === undefined || value.startsWith('--')) {
-    console.error('FAIL ' + name + ' 缺少取值')
+    console.error('FAIL ' + name + ' needs a value')
     process.exit(2)
   }
   return value
@@ -141,7 +141,7 @@ const ANCHORS = [
  */
 function inject(source, sourcePath, maskNative) {
   if (/^- id: tool-text-editor$/m.test(source)) {
-    throw new Error('源组合里已经有 tool-text-editor 行了 —— 请指向 dsh 自带的原始组合')
+    throw new Error('the source composition already has a tool-text-editor row -- point at the unmodified composition shipped with dsh')
   }
   const block = pluginBlock(sourcePath, maskNative)
   for (const { pattern, label } of ANCHORS) {
@@ -169,36 +169,36 @@ const explicitPath = explicitSource === '' ? undefined : resolve(explicitSource)
 const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
 
 if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
-  console.error('FAIL preset id 必须是 [a-z0-9][a-z0-9-]*（会作为目录名），收到：' + id)
+  console.error('FAIL the preset id must match [a-z0-9][a-z0-9-]* (it becomes a directory name), got: ' + id)
   process.exit(2)
 }
 if (!/^[a-z0-9][a-z0-9-]*$/.test(base)) {
-  console.error('FAIL --base 必须是 dsh 自带 preset 的 id（如 standard / minimal / cordis / ptc），收到：' + base)
+  console.error('FAIL --base must be the id of a preset shipped with dsh (standard / minimal / cordis / ptc), got: ' + base)
   process.exit(2)
 }
 if (!existsSync(PLUGIN)) {
-  console.error('FAIL 找不到插件文件：' + PLUGIN)
+  console.error('FAIL plugin file not found: ' + PLUGIN)
   process.exit(1)
 }
 if (maskNative && !existsSync(MASK)) {
-  console.error('FAIL 找不到门禁文件：' + MASK + '（--mask-native 需要它）')
+  console.error('FAIL mask file not found: ' + MASK + ' (--mask-native needs it)')
   process.exit(1)
 }
 if (!existsSync(META)) {
-  console.error('FAIL 找不到 preset 元数据：' + META)
+  console.error('FAIL preset metadata not found: ' + META)
   process.exit(1)
 }
 if (explicitPath !== undefined && !existsSync(explicitPath)) {
-  console.error('FAIL --from / DSH_PRESET_SOURCE 指向的组合不存在：' + explicitPath)
+  console.error('FAIL --from / DSH_PRESET_SOURCE points at a composition that does not exist: ' + explicitPath)
   process.exit(2)
 }
 
 const candidates = findCompositions(base, explicitPath, dshHome)
 const sourcePath = candidates.find((candidate) => existsSync(candidate))
 if (sourcePath === undefined) {
-  console.error(`FAIL 找不到本机 dsh 自带的 preset 组合（--base ${base}）；试过：`)
+  console.error(`FAIL no preset composition shipped with the local dsh (--base ${base}); tried:`)
   for (const candidate of candidates) console.error('  ' + candidate)
-  console.error('     装了 dsh 就有；也可以用 --from <agent.cordis.yml 路径> 或 DSH_PRESET_SOURCE 指定。')
+  console.error('     installing dsh provides it; you can also point --from <agent.cordis.yml path> or DSH_PRESET_SOURCE at one.')
   process.exit(2)
 }
 
@@ -245,16 +245,16 @@ if (dryRun) {
   if (exists && !force) {
     // 只预告冲突：dry-run 不落盘，退出码按契约仍为 0。
     console.error('')
-    console.error('[dry-run] 但目标已存在，真跑会被拒绝：' + targetComposition)
-    console.error('          要覆盖请加 --force（只覆盖 agent.cordis.yml 与 preset.yml，同目录其它文件不动）。')
+    console.error('[dry-run] but the target already exists, so a real run would be refused: ' + targetComposition)
+    console.error('          add --force to overwrite (only agent.cordis.yml and preset.yml are replaced; other files in that directory are left alone).')
   }
   process.exit(0)
 }
 
 if (exists && !force) {
   console.error('')
-  console.error('FAIL 该 preset 已存在：' + targetComposition)
-  console.error('      要覆盖请加 --force（只覆盖 agent.cordis.yml 与 preset.yml，同目录其它文件不动）。')
+  console.error('FAIL that preset already exists: ' + targetComposition)
+  console.error('      add --force to overwrite (only agent.cordis.yml and preset.yml are replaced; other files in that directory are left alone).')
   process.exit(1)
 }
 if (exists) {

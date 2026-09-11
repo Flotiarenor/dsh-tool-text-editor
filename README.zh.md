@@ -1,30 +1,23 @@
 # dsh-tool-text-editor
-
 中文 | [English](README.md)
 
-[DeepSeek Harness](https://github.com/deepseek-ai)（dsh）的模型工具插件，提供两个**字节保真**的文本编辑工具：`edit_text` 与 `write_text`。它补上原生 `write` / `edit`（由 `@deepseek-ai/dsh-fs-local` 实现）做不到的事，前两条已在真实安装上实测（见「与原生工具的实际差异」）：
+[DeepSeek Harness](https://github.com/deepseek-ai)（dsh）的模型工具插件，提供两个**字节保真**的文本编辑工具：`edit_text` 与 `write_text`。它替换原生 `write` / `edit`（由 `@deepseek-ai/dsh-fs-local` 实现）并修复以下缺陷：
 
 | 原生行为 | 成因 | 本插件 |
 | ---- | ---- | ------ |
-| 改一行或整篇覆盖都**丢 UTF-8 BOM** | 该实现没有 BOM 处理；Node 的 `TextDecoder` 默认吞掉前导 BOM 字节 | BOM 保住 |
-| 整篇覆盖**不还原行尾风格** | `writeText` 原样落盘 `content`，于是 LF 内容把 CRLF 文件变成 LF 文件 | 行尾跟随文件 |
+| 改一行或整篇覆盖丢失 UTF-8 BOM | 未实现 BOM 处理；Node 的 `TextDecoder` 默认吞掉前导 BOM 字节 | BOM 不变 |
+| 整篇覆盖不还原行尾风格 | `writeText` 原样落盘 `content` | 行尾跟随文件 |
 | `old_string` 差一个空格即报 **`FS_EDIT_NOT_FOUND`** | 原生 `edit` 只做精确匹配，没有回退 | 精确 → 宽松 → 最接近候选（歧义时拒绝写盘） |
 
-此外提供 **`grep` / `lines` 锚点**（无需人工誊抄原文）与**最接近候选**提示。返回值与模型可见文本的构成见「返回值」。
-
-一次调用**不留下任何旁路产物**：唯一被写入的就是目标文件本身。
+此外提供 `grep` / `lines` 锚点。
 
 ## 实现与依赖
 
-实现是**进程内 Node**（`lib/core.mjs`）：只用 `node:` 内置模块，不启动任何子进程，无构建步骤，无第三方依赖。
-
-| 依赖 | 说明 |
-| ---- | ---- |
-| Node | 插件唯一的依赖。不启动解释器、不引入外部运行时；每次调用均无进程启动开销。 |
+实现是**进程内 Node**（`lib/core.mjs`），不启动任何子进程，无构建步骤，无第三方依赖。
 
 ## 安装
 
-### 方式一：preset（推荐，作用域最小）
+### 方式一：preset（作用域最小）
 
 仅选定该 preset 的会话可见这两个工具，其它项目与会话的工具表不受影响。**在本仓库根目录**执行：
 
@@ -55,109 +48,56 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 
 `edit_text` / `write_text` 与原生工具不重名，插入宿主组合不会产生注册冲突。卸载：`dsh plugin --profile web remove @flotiarenor/dsh-tool-text-editor`。
 
-两种方式可以并存：同名时 preset 层的注册会遮蔽宿主层的注册，二者定义相同、行为一致。
+| 机制 | 作用方式 |
+| --- | --- |
+| `apply()` 阶段挂在本行作用域层上的守卫 | 否决任何 agent 的首次原生调用，并在同一次调用中将其收窄 |
+| 工具表与执行 | `agent.ctx.tools.restrict({ deny: ['write','edit'] })`——被点名的工具离开工具表，且无法调用 |
+| 提示词 | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` 遮蔽 `dsh-tool-fs` 注册的两段引导 |
+| 退出组合与卸载 | `restrict` 与空段均注册在 **agent 自身的层**上，不随 preset 更换消失； |
+| 宿主平面安装 | 挂在宿主平面（profile 层）的行没有作用域，守卫落入全局层，而该层的"收窄"会连带修改未挂本插件的 preset。
 
-## 屏蔽原生 `write` / `edit`（可选）
-
-`lib/mask.mjs` 是一行独立的插件：装进 preset 后，**该 preset 的会话里就没有原生 `write` / `edit`**。安装时加一个开关即可：
-
-```powershell
-node scripts/install-preset.mjs --mask-native   # 多插一行 tool-native-edit-mask，并给编辑行写 guidance: short
-```
-
-省下的是每次请求 **2362 B**（`node tools/measure-context.mjs --vs-native` 实测）：两个 schema 1754 B（`write` 728 + `edit` 1026，含沙箱升权字段）加两段引导 608 B（220 + 388）；再把编辑行的 `guidance` 换成 `short` 又省 81 B（241 → 160）。合计 **2443 B/请求**（约 600 token）。
-
-它走三条通路，并且知道怎么**退出组合**：
-
-1. **`apply()` 阶段就挂守卫**（`ctx.tools.guard(...)`，挂在本行自己的作用域层上）：与 agent 什么时候加入组合**无关**。任何时刻进来的 agent，第一次直呼原生工具都会被否决（原因里点名 `edit_text` / `write_text`），这一次调用就顺手把它收窄——于是**下一次请求**的工具表已经干净。它是"最迟防线"，不是主路径。
-2. **`agent/created`**：建档时加入本 preset 的 agent（含 subagent）立即收窄。
-3. **`tools/change`**：`recompose()` 重绑作用域之后会发它，这就是 GUI 换 preset 的那条路；收到后枚举 `ctx.agents.list()`，把**属于本组合**的 agent 收窄。
-4. **退出组合也要还原**：`restrict` 与空段都注册在 **agent 自己的层**上，不随 preset 更换消失。所以每个 agent 的注册句柄都留着，一旦它被重新挂到别的 preset 就成对撤销——否则那个 agent 在新 preset 里既没有原生名字、也没有本插件的工具，等于**一个写工具都不剩**。
-
-| 通道 | 调用 | 效果 |
-| --- | --- | --- |
-| 守卫 | `ctx.tools.guard(...)` | 否决这次调用（原因里点名本插件的工具，模型可见）；`deny` 档下顺手把该 agent 收窄 |
-| 工具表与执行 | `agent.ctx.tools.restrict({ deny: ['write','edit'] })` | 被拒的名字**既不出现在工具表里，也调不动**——直呼其名得到 `UNKNOWN_TOOL` |
-| 提示词 | `agent.ctx.systemPrompt.section({ name: 'tool:write', text: '' })` | 在更近的层注册同名**空段**，遮蔽 `dsh-tool-fs` 注册的那两段引导——如今是冗余保险，见下面的配置表 |
-
-`restrict()` 只能从**带作用域的上下文**（`agent.ctx`）调用；从 preset 常驻作用域（也就是插件行自己的 ctx）调用会被拒绝——同一层里注册的名字不算"可限制的全局工具"。守卫的价值在于让另外两条通路的时序变得无关紧要：GUI 的真实流程是"先按默认 preset 建 agent，再把用户选的 preset 重新挂上去"，而 `AgentPresets.recompose()` 做的是**父级 re-link，不是重建 agent**，所以 `agent/created` 早就在旧组合下发完了，新挂上来的监听器永远收不到那个 agent。实测：这个 preset 的会话里，`request/header` 事件中 25 条仍列着原生 `write` / `edit`，只有 3 条收窄了。
-
-归属判据（"这个 agent 是不是加入了我这个组合"）不能 import `@deepseek-ai/dsh-scope`：本包"零依赖、只用 `node:` 内建"是 `tools/check-license.mjs` 的硬断言。等价判据在 `dsh-tools` 里：用 `ctx.tools.guardReason(<本模块自己铸的探测对象>)` 探测，它会遍历 `exec.agent` 的作用域链，**本行的层只在链上时才会走到本行的守卫**，所以这条判据只依赖 `dsh-tools`。判据是探测对象的**对象身份**，不是名字：`guardReason()` 跑在"工具存不存在"之前，看不见的名字一样会走到守卫，所以"起个没人用的名字"并不够。真实派发每次都会铸一个新的执行对象，永远不可能等于探测对象，也就永远拿不到哨兵；答复还要与哨兵比对，所以"对任何调用都回一句理由"的别人的守卫（宿主里的 in-process subagent driver 就带一个，而 `guardReason` 先看全局层）不会被误认成本行的答复。
-
-判据是三态——`member` / `outsider` / `unknown`——而巡查只在确定是 `outsider` 时才撤销：探测答不出来（守卫没挂上、这个版本的 dsh 没有 `guardReason`、查询抛错）**或者答复来自别人**，都意味着"别动这个 agent"；把 `unknown` 当成 `outsider` 会**悄悄拆掉**一条本来有效的收窄。这份谨慎的代价是双向的、也写在代码里：判据答不出来时，"换掉的 preset 把原生工具还回来"那一半同样降级，所以本行会记一条 warn，而不是悄悄只做一半。
-
-这些注册挂在 **agent 的 fiber** 上，所以**本行自己被卸载**（HMR 重载、给 preset 行加 `disabled: true`）时它们不会跟着走——本行因此注册了卸载钩子，把手上所有 agent 的注册一并撤销。
-
-**宿主平面安装（profile 层）是另一档**：那里的上下文没有作用域，守卫会落到全局层，而全局层的"收窄"会连没有挂本插件的 preset 一起改。本行用同一个探测发现这件事（**不带 agent** 的探测只有全局层上的守卫会回答），自动退化成"只管守卫、绝不收窄"，并记一条 warn。这一档不需要任何配置键——挂载形状自己决定了行为。
-
-### 屏蔽之后还能测原生工具吗？能，四条路
-
-1. **换一个组合（另一个 preset）**：门禁是**组合事实**，不是全局开关。别的组合里的 agent 照旧看得见、也调得动——`tools/probe-mask.mjs` 与 `tools/repro-mask.mjs` 都断言了这条对照组；而**同一个 preset 里的兄弟 agent 一样被屏蔽**，那是有意的。
-2. **进程内探针**：`node tools/probe-mask.mjs` 用真实的 dsh 包（`dsh-tools` + `dsh-scope` + `dsh-system-prompt` + `cordis`）与真实的 `dsh-agent` 注册表复刻挂载形状：门禁行用**真实的作用域上下文**挂（守卫必须在 `apply` 阶段落到那一层上），`agent/created` 由注册表派发而不是手工投递。18 项全过（找不到 dsh 包时退出码 2）；断言清单见「自测与门禁」。
-3. **直接驱动原生工具**：`tools/measure-context.mjs --vs-native` 在进程内对真实的 `dsh-tool-fs` 调 `apply()` 并量它的 schema 与引导段——不经过任何 agent，门禁管不着。
-4. **临时撤掉**：给 preset 里的 `tool-native-edit-mask` 行加 `disabled: true`，或改用 `mode: 'guard'`。
-
-### `mode: 'guard'`：留一条观察窗
-
-`mode: 'guard'` 保留 apply 阶段的守卫、跳过 `restrict`：工具**保持可见**，调用被否决，拒绝原因里点名 `edit_text` / `write_text`。代价是 **schema 的钱照付**（两张表照旧下发，1754 B），而那两段引导仍被空段遮蔽——调用都被拒了，留着引导只会让模型去试。换来的是原生工具仍可被调用、可观察。
 
 ### 门禁行配置
 
-门禁行同样不定义 Config schema：preset 行的 `config:` 字段原样透传。
+不定义 Config schema：preset 行的 `config:` 字段原样透传。
 
 | 键 | 默认 | 含义 |
 | --- | --- | --- |
-| `mode` | `'deny'` | `deny`：名字从工具表里消失（`restrict`），守卫再兜住仍然看得见的调用；`guard`：工具保持可见，每次调用都被否决 |
-| `deny` | `['write','edit']` | 要收窄的名字；只点名该 agent **真的看得见**的名字 |
-| `sections` | `['tool:write','tool:edit']` | 用空段遮蔽的引导段名，`[]` 关闭。如今是**冗余保险**：0.1.5-rc.2 起 `dsh-tool-fs` 的引导段按作用域求值（`({ scope }) => ctx.tools.get('write', scope) === undefined ? '' : '…'`），工具一被收窄，那段引导自己就不下发了 |
-
-### 边界
-
-- **不是权限边界**：这是 dsh 文档所说的 live visibility composition。原生工具**仍然注册在注册表里**（GUI 的插件/工具清单可能照旧列出它们），shell 命令也一样能写文件——`tools/probe-mask.mjs` 专门断言了这条。
-- **是组合事实，不是全局开关**：门禁只碰加入本行组合的 agent——**同一个 preset 的兄弟 agent 一起屏蔽，别的 preset 的 agent 一个不碰**。宿主平面安装是唯一的例外，而它从不收窄。
-- **名字可配**：`deny` / `sections` 都是 config，`tool-fs` 改名或拆包时改配置即可。
-- **只点名看得见的名字**：preset 没挂 `tool-fs` 时门禁什么都不做（不会因未知名字抛错），段遮蔽照旧；守卫在**调用发生时**按 `exec.agent` 重新问一次可见性，所以"别处看得见、这个 agent 看不见"的名字它不会碰。
+| `deny` | `['write','edit']` | 要收窄的名字 |
+| `sections` | `['tool:write','tool:edit']` | 用空段遮蔽的引导段名，`[]` 关闭遮蔽 |
 
 ## 工具契约
 
 ### `edit_text` —— 局部替换
 
-| 参数          | 必填 | 说明                                                                     |
-| ------------- | ---- | ------------------------------------------------------------------------ |
-| `file_path` | ✅   | 目标文件；相对路径按会话工作区解析。                           |
-| `new_text`  | ✅   | 替换或插入的内容。                                                       |
-| `old_text`  | -    | 字面量锚点（可直接复制 `read` 的输出）。                            |
-| `grep`      | -    | 正则锚点：命中的行或行块作为锚点（含行尾换行符）。                       |
-| `lines`     | -    | 行号锚点，如 `"263:270"` 或 `"120"`（同样含行尾换行符）。             |
-| `mode`      | -    | `replace`（默认）/ `after` / `before` / `append` / `prepend`。 |
-| `count`     | -    | 声明期望的命中数：`old_text` 是"同一字面量出现几次"（全部替换），`grep` 是"正则命中几处"，`lines` 是"覆盖几行"。与实际情况不符即拒绝写入。 |
+| 项 | 规则 |
+| --- | --- |
+| 必填 | `file_path` 与 `new_text` |
+| 锚点，且恰好一个 | `old_text`（字面量，抄自 `read`）/ `grep`（正则；命中的行或行块，含行尾换行符）/ `lines`（如 `"263:270"`，同样含行尾换行符） |
+| `mode` | `replace`（默认）/ `after` / `before` / `append` / `prepend` |
+| `count` | 声明的命中数：`old_text` 为字面量出现次数（全部替换），`grep` 为正则命中处数，`lines` 为覆盖行数。与实际情况不符即拒绝写入 |
+| 尾随换行 | 两种锚点都覆盖整行行块**并含行尾换行符**，因此 `new_text` 也应以换行结尾；否则替换会把下一行并入 |
+| 匹配顺序 | 精确 → 宽松（忽略行尾空白、按行块相似度）→ 未命中时给出最接近的候选；命中多处且未声明 `count` 时拒绝写盘，宽松命中会在结果中附加一行 `[warn]` |
+| 无"第 k 处" | `count` 是唯一的消歧旋钮，语义是**确认**而非**选择**。需要只改其中一处时，把锚点写到唯一——更长的 `old_text`，或改用 `lines` / `grep` |
 
-`old_text` / `grep` / `lines` **必须且只能提供一个**；`append` / `prepend` 不接受锚点，`after` / `before` 只能与 `grep` / `lines` 搭配。数量不符将拒绝写入。
-
-两种锚点都覆盖整行行块**并含行尾换行符**，所以 `new_text` 也要以换行结尾——否则替换会把下一行并进来，文件少一行（统计里的 `+1/-2` 会反映出来）。
-
-匹配顺序为精确 → 宽松（忽略行尾空白、按行块相似度）→ 失败时给出最接近的候选；命中多处且未声明 `count` 时拒绝写盘，宽松命中还会在结果里带一行 `[warn]`。宽松命中也遵守"命中多处即拒绝"：两处同样能宽松命中时不会按文件顺序挑第一处，而是列出候选行号，请抄更长的 `old` 或改用 `lines` / `grep`。**空的** `old_text` 会被拒绝：它没有指向任何内容（行块锚点请用 `lines` / `grep`）。
-
-**没有"只改第 k 处"这类参数**：`count` 是唯一消歧旋钮，它的语义是**确认**（声明命中数、不符即拒绝）而不是**选择**（挑一处、其余照旧）。需要"只改其中一处"时，把锚点写准到唯一——抄更长的 `old`，或改用 `lines` / `grep` 直接点名位置。这样一次错锚点不会变成静默的错编辑。
-
-宽松命中的 span 是**整行块**（含行尾空白与换行符），而 `old_text` 可能没有换行结尾——最常见的原因是它抄自 `read` 的输出，那里不显示行尾空白。这时工具把行尾空白与换行符留在文件里，只换行内容：`old_text: 'gamma'` 配上 `new_text: 'GAMMA'` 会把 `'\tgamma   \n'` 变成 `'\tGAMMA   \n'`，行数不变，并在 `[warn]` 里说明。锚点**自己带着换行结尾**、`new_text` 却没有时，行会被并起来（`lines` / `grep` 锚点同理）——那是调用方在按行边界寻址，结果里的 `[warn]` 会点名这件事。
+`old_text` / `grep` / `lines` **必须且只能提供一个**；`append` / `prepend` 不接受锚点，`after` / `before` 只能与 `grep` / `lines` 搭配。**空的** `old_text` 会被拒绝：它没有指向任何内容（行块锚点请用 `lines` / `grep`）。
 
 ### `write_text` —— 整文件新建/覆盖
 
-`file_path` + `content`；目标不存在时自动新建（含补齐缺失的父目录）。新建文件的行尾风格取自同目录的多数派（同扩展名优先），默认不写 BOM。**`content: ''` 配一个不存在的目标就是创建零字节文件**（统计行是 `write +0/-0`）；但往一个已经空的文件再写空内容仍按"没有产生任何变化"拒绝——那是真的一致，不是新建。
+`file_path` + `content`；目标不存在时自动新建（含补齐缺失的父目录），新建文件的行尾风格跟随同目录（同扩展名优先），默认不写 BOM。**`content: ''` 配不存在的目标即创建零字节文件**（统计行为 `write +0/-0`）；但向已为空的文件再写空内容仍按"没有产生任何变化"拒绝。
 
 ### 返回值
 
-两个工具返回同一份规范值（`OUTPUT_SCHEMA`），而它就是结果的全部：没有呈现通道，也没有旁路记录。`render` 只读 `ok` / `brief` / `stderr`；`path` 为调用方保留，但不渲染。
+`render` 只读 `ok` / `brief` / `stderr`；`path` 为调用方保留，但不渲染。
 
-| 字段       | 内容                                             | 去向       |
-| ---------- | ------------------------------------------------ | ---------- |
-| `path`   | 调用方给出的目标路径                             | 仅规范值，**不渲染** |
-| `ok`     | 是否写入成功                                     | 模型上下文（`FAIL` 还是 `WROTE`） |
-| `brief`  | 一行统计（如 `replace@17 +1/-1`）与必要的警告行  | 模型上下文 |
-| `stderr` | 失败原因（失败时非空）                           | 模型上下文 |
+| 字段 | 内容 | 去向 |
+| --- | --- | --- |
+| `path` | 调用方给出的目标路径 | 仅规范值，**不渲染** |
+| `ok` | 是否写入成功 | 模型上下文（`FAIL` 或 `WROTE`） |
+| `brief` | 一行统计（如 `replace@17 +1/-1`）与必要的警告行 | 模型上下文 |
+| `stderr` | 失败原因（失败时非空） | 模型上下文 |
 
-模型可见文本因此只有两种形状：
+模型可见文本如下：
 
 ```
 WROTE                   # 成功：一行统计 + 警告
@@ -166,104 +106,27 @@ FAIL                    # 失败：完整原因（决定下一次调用）
 <原因>
 ```
 
-**成功路径不回显改动内容**：工具结果按追加方式进入会话历史，任何内容回显都会随调用次数累积，而调用方刚发过 `new_text`；`replace@17 +1/-1` 已说明改在哪几行、改了多少，需要看正文时 `read` 一次即可。因此单次调用的模型可见字节与输入规模无关（实测：400 KB 的单行写入仍只回 2 行 / 17 B）。
-
-**成功路径也不回显路径**：结果与调用一一绑定（`tool/result` 带 `source.callId`），调用方自己那条 `file_path` 参数就在同一轮历史里，逐字回显它新信息量为零——而它并不便宜：在本机 79 个会话、86 条结果里，一次成功平均 116 B，其中 `WROTE <路径>` 一行占 **55.6 B（48%）**；去掉路径后平均 66 B（−43%）。路径仍然出现在**它真正携带信息**的两处：需要指名文件的失败**原因**里，以及 GUI 自己渲染调用参数的时候。
-
-**没有别的写入**：不写备份、不写台账、不投影 diff。改动是什么，GUI 从调用参数本身就看得到（`old_text` / `grep` / `lines` 加 `new_text`，宿主本来就会渲染），改动前的内容一次 `read` 即可拿到。系统调用失败只报 errno 与一句原因（`ENOENT`、`ENOTDIR`、`EISDIR`、`EACCES` 等）：Node 原始 message 中的绝对路径与内部临时文件名（`.<名字>.<pid><ts>.tmp`）不进入模型上下文。
-
-原生工具唯一有、而本插件没有的东西是**结果里的 diff 正文**：原生 `write` 返回 `before` / `after` 供宿主画卡片，代价是每次调用多 128 B。这里改由宿主拿调用参数来画——那些参数它本来就有。
-
 ## 已知限制
 
-以下均为有意的设计取舍，而非缺陷；采用前请对照自身场景确认。
-
-- **写入不经由 `ctx.fs`。** 文件由本插件直接写入，因此不经过 fs 观察策略（先读后写、版本新鲜度校验）、沙箱与 `sandbox_permissions` 审批升权，也不保留 Windows DACL。原子写由本插件自行实现（同目录临时文件 + fsync + rename）。这条路径上没有第二个强制点，插件因此把会话自己的文件策略里**唯一禁止写入的那一档**镜像了回来：`read-only` 会话下两个工具都在任何 I/O 之前拒写，原因里点明这是会话策略而非路径问题。`sandboxPolicy` 是可选消费（`ctx.get`）：服务缺席或解析抛错时退回既有行为，不会把写盘全禁掉。
-- **只镜像了 `read-only` 一档，且不做任何路径限制。** `workspace-write` 与 `danger-full-access` 下两个工具都能写**任何**路径：工作区之外、`.dsh/` 与 `.git/` 内部、以及工作区里指向外部的 junction / symlink 之后。这不是遗漏，是一次明确的取舍——本包曾有的路径护栏按**字符串前缀**判定，既能被符号链接绕过（看着有护栏、实际能穿出去），又会在 full-access 会话里把模型本来有权限写的位置一并禁掉，而后者的代价更大。因此本包**不是安全边界**，也不假装能替代宿主策略、沙箱或审批：要限制可写范围，请用会话文件策略、沙箱与 `sandbox_permissions`（或 shell 侧护栏），本包不参与那层判断。
-- **行号锚点不做内容校验。** `lines` 与 `before` / `after <行号>` 仅按行号定位：行号有误不会报错，改动会落在非预期位置；定位需要可校验时，请改用 `old_text` 或 `grep`。
-- **同目标串行仅限本进程。** 进程内按目标路径排队，并配合原子写，故并行的工具调用不会相互覆盖；但另一个 dsh 实例、编辑器或其它进程同时修改同一文件时，仍可能相互覆盖，本插件也不检测外部改动。
-- **仅处理 UTF-8 文本。** 含 NUL 字节的二进制文件与非法 UTF-8 文件一律拒绝。被操作系统标记为只读的文件同样拒绝（原子 rename 会以 `EPERM` 失败），并且**不会**悄悄清掉那个属性。
-- **新建文件会补齐缺失的父目录。** `write_text` 目标不存在时按 `mkdir -p` 补齐（与原生 `write` 一致）；该动作不产生额外输出。
-- **旁路不留任何记录。** 没有备份、没有台账、没有 diff 投影：一次成功调用之后，改动前的内容只存在于编辑器或版本控制留下的副本里。这是有意做的减法，理由见「与原生工具的实际差异」。
+| 限制 | 说明 |
+| --- | --- |
+| **写入不经由 `ctx.fs`** | 文件由本插件直接写入，因此不经过 fs 观察策略（先读后写、版本新鲜度校验）、沙箱、`sandbox_permissions` 审批升权，也不保留 Windows DACL；原子写由本插件自行实现（同目录临时文件 + fsync + rename）。这条路径上没有第二个强制点，插件因此把会话文件策略里**唯一禁止写入的那一档**镜像回来：`read-only` 会话下两个工具都在任何 I/O 之前拒写，原因中指明这是会话策略而非路径问题。`sandboxPolicy` 是可选消费（`ctx.get`），服务缺席或解析抛错时照旧写入，不会把写盘全部禁掉 |
+| **只镜像 `read-only` 一档，且不做任何路径限制** | `workspace-write` 与 `danger-full-access` 下两个工具都能写**任何**路径：工作区之外、`.dsh/` 与 `.git/` 内部、以及工作区内指向外部的 junction / symlink 之后。本包**不是安全边界**：要限制可写范围，请用会话文件策略、沙箱与 `sandbox_permissions` |
+| **行号锚点不做内容校验** | `lines` 与 `before` / `after <行号>` 仅按行号定位：行号有误不会报错，改动会落在非预期位置。定位需可校验时，请改用 `old_text` 或 `grep` |
+| **同目标串行仅限本进程** | 进程内按目标路径排队，并配合原子写，因此并行的工具调用不会相互覆盖；但另一个 dsh 实例、编辑器或其它进程同时修改同一文件时，仍可能相互覆盖，本插件也不检测外部改动 |
+| **仅处理 UTF-8 文本** | 含 NUL 字节的二进制文件与非法 UTF-8 文件一律拒绝；被操作系统标记为只读的文件同样拒绝（原子 rename 会以 `EPERM` 失败） |
 
 ## 配置
 
 本插件不定义 Config schema：preset 行的 `config:` 字段原样透传。
 
-| 键               | 默认              | 含义                                             |
-| ---------------- | ----------------- | ------------------------------------------------ |
-| `newFileBom`   | `false`         | 新建文件时是否写 UTF-8 BOM                       |
-| `guidance`     | `'full'`        | 引导段三档：`full`（含"优先于原生"）/ `short`（原生已被门禁屏蔽时用）/ `false`（整段不注册） |
-| `root`         | `process.cwd()` | 无 agent 会话时的回退工作区                      |
+| 键 | 默认 | 含义 |
+| --- | --- | --- |
+| `newFileBom` | `false` | 新建文件时是否写 UTF-8 BOM |
+| `guidance` | `'full'` | 三档：`full`（指名原生工具）/ `short`（门禁屏蔽原生工具时用）/ `false`（整段不注册） |
+| `root` | `process.cwd()` | 无 agent 会话时的回退工作区 |
 
 环境变量 `DSH_TEXT_EDITOR_EOL`（`lf` \| `crlf`）可覆盖**新建文件**的行尾推断。
-
-## 与原生工具的实际差异
-
-在真实安装上实测（dsh 0.1.5-rc.2，`lib/editor.mjs` 对 `dsh-tool-fs`），两列写的是同一份样本：
-
-| 样本 | 原生 | 本插件 |
-| ---- | ---- | ------ |
-| CRLF 文件，`write` 的 content 也是 CRLF | 3 个 CRLF 进、3 个出（content 原样落盘） | 相同 |
-| CRLF 文件，`write` 的 content 是 LF | **3 个 CRLF 进、0 个出**——文件静默变成 LF | 保住 CRLF：以文件自身风格为准 |
-| BOM + CRLF 文件，任一工具 | **BOM 丢失** | BOM 保住 |
-| 锚点少一个尾随空格 | `FS_EDIT_NOT_FOUND`，无回退（只能重读文件再试） | 宽松的行块匹配，结果里带一行 `[warn]` |
-| 同一字面量出现两次 | 拒绝（`FS_AMBIGUOUS_EDIT`），除非 `replace_all: true` | 拒绝，除非用 `count` 声明 |
-| 成功结果文本 | 128 B，回显 `before` / `after` 供 GUI 画卡片 | 17–21 B，什么都不回显 |
-
-所以老实的账是：**一条正确性修复（BOM）+ 一条行为修复（行尾风格），外加更便宜的结果文本。** 其余差距都是便利——能点名位置的锚点，以及近似锚点的回退。如果你不碰带 BOM 的文件，唯一拿到手的就是 token（按场景大约每次调用省 3%–45%），而代价是模型面前多了两个要选的写工具。
-
-## 自测与门禁
-
-```powershell
-# 在本仓库根目录执行
-node tools/selftest.mjs                 # Windows + Node 24 参考结果 150/150
-node tools/check-license.mjs            # 许可证 / 依赖 / 纯 Node 门禁，30/30
-node tools/gen-schema.mjs               # 内嵌 schema 是否仍与作者 DSL 一致
-node tools/measure-context.mjs          # 逐场景量模型可见字节
-node tools/audit-session.mjs            # 用真实会话日志对账（含文本形状检查）
-node tools/audit-session.mjs --tools    # 逐条 request/header 的真实工具表（门禁验收）
-node tools/probe-mask.mjs               # 真实 dsh 包 + 注册表上的门禁语义（18 项，缺包时退出码 2）
-node tools/repro-mask.mjs               # 真实 preset + agent 注册表上的组合时序（23 项，缺包时退出码 2）
-```
-
-`npm test` 串起许可证门禁、自测与 `measure-context --cap 2048`；后者保证任何一次调用的模型可见文本都不超过 2 KB——当前实现的最坏场景是 1.6 KB 的歧义提示，成功路径固定 2 行 / 17–21 B。
-
-`tools/selftest.mjs` 覆盖：BOM 与行尾保真、四种锚点、`count`、歧义时拒绝写入、宽松匹配通报（含相似度阈值两侧各一条断言）、用法错误、二进制与非法 UTF-8、`.dsh/` 内部与工作区之外的路径照写（无路径护栏）、行尾多数派推断、多 hunk、末尾换行差异、并发写入不产生半截文件、新建时补齐父目录、系统调用失败只报 errno。另有**插件层断言**：以模拟 ctx 驱动 `apply()`，验证工具注册、引导段身份、每个返回值恰好四个字段且满足 `OUTPUT_SCHEMA`、`render()` 的字面形状、config 透传（`root` / `newFileBom`），以及一次写入不在工作区留下 `.dsh/`；**返回值约束断言**：无论输入多大，成功路径都只有两行、不含改动内容、也不重复路径；**策略断言**：`read-only` 下两个工具在任何 I/O 之前拒写（不留字节、不留旁路产物），`workspace-write` / `danger-full-access` 照旧写，策略服务缺席或抛错不误伤写入；**门禁断言**：假世界另外建模了 `apply` 阶段的守卫注册、归属探测（`guardReason()` 只对成员走到本行守卫）、`tools/change` 巡查、离开组合时成对撤销与重新加入后再收窄、宿主平面的降级，外加只点名本 agent 看得见的名字、两种模式各自调用什么、空段与顺序、重复事件不重复注册、探测不可用时绝不撤销既有收窄、守卫注册失败要留日志、注册表或提示词服务抛错时不把 agent 创建带崩；**引导段断言**：`full` / `short` / `false` 三档与非法取值报错。
-
-`tools/probe-mask.mjs` 用**真实的** dsh 包（`dsh-tools` + `dsh-scope` + `dsh-system-prompt` + `cordis`）与真实的 `dsh-agent` 注册表复刻 preset 的挂载形状，验证门禁在注册表里的实际语义：受限 agent 的工具表里没有 `write` / `edit`、直呼得到 `UNKNOWN_TOOL`、**别的组合**里的 agent 照旧看得见也调得动、受限 agent 的提示词里没有原生那两段引导、常驻作用域仍注册着它们（可见性组合而非权限边界）、**没有经过建档事件**的 agent 也会被 apply 阶段的守卫拦下并当场收窄、`mode: 'guard'` 下"可见但被拒"，以及挂在宿主平面的行退化成"只管守卫"并留下一条 warn。共 18 项；缺少 dsh 包时退出码 2。
-
-`tools/repro-mask.mjs`（npm 脚本 `npm run repro:mask`）在临时目录里用**真实的** `@deepseek-ai/dsh-agent-presets` 服务与**真实的** `@deepseek-ai/dsh-agent` 注册表驱动真实的 `agent.cordis.yml` 组合（本仓库的 `lib/mask.mjs` 按绝对路径入列），逐条路径断言最终的工具表：建档前挂载、建档后换 preset（`recompose()`）、首次绑定、换出去、以及跟随父组合的子 agent——外加"自带一个对任何调用都回理由的守卫"的宿主（归属探测不能被它蒙对）与另一个组合的 agent 作对照组。共 23 项；它是组合时序 bug 的回归测试（修之前 4/7），需要上面那些 dsh 包（缺包时退出码 2）。
-
-### 上下文开销的测量
-
-`tools/measure-context.mjs` 以模拟 ctx 驱动 `apply()`，走真实的 `execute()` → `output.render()` 路径，逐场景输出入参字节、模型可见字节、倍率与行数。`--cap N`：任一场景超过 N 字节即退出码 1。`--static` 输出每请求的静态开销；`--vs-native` 追加宿主 `write` / `edit` 的同一组数据（未找到 dsh 安装时输出 SKIP）。`--static --vs-native` 就是上面那张屏蔽账的来源。
-
-`tools/audit-session.mjs` 以真实会话日志（`<DSH_HOME>/sessions/`，分帧 zstd，按调用对账）核对三项：每条结果是否符合当前两种形状之一——`WROTE` + 统计行的成功形状、`FAIL` + 原因的失败形状——出现 diff 正文 / `=== ` 头 / `OK ` 尾或内部临时文件名即判为不符；成功结果是否回显了本次调用自己的 `file_path`（那正是这次形状要杜绝的回归）；单条结果是否超过 `--cap`（默认 1024 B）。这个形状之前的旧结果单独按"遗留"统计。
-
-`--tools` 换一个视角：逐个会话打印每条 `request/header` 事件里**真正下发的工具表**与判定行（`native write/edit: PRESENT (...)` 还是 `masked`，以及 `edit_text` / `write_text` 在不在），末尾给汇总。这张表就是模型当轮看到的东西，所以它是判断门禁有没有生效的唯一验收标准：`node tools/audit-session.mjs --tools`。
-
-`tools/gen-schema.mjs` 需要一份装有 `@deepseek-ai/dsh-tools` 的 dsh：它会在 dsh profile 的 `node_modules` 与 npm 全局目录中自动查找，也可用 `DSH_TOOLS_ENTRY` 显式指定；找不到入口时退出码为 2。
-
-## 目录结构
-
-```
-lib/core.mjs             # 编辑核心：BOM/行尾、锚点、匹配、原子写、同目标串行
-lib/editor.mjs           # 插件本体：schema、参数校验、工具注册、read-only 镜像（零依赖 ESM，无构建）
-lib/mask.mjs             # 可选门禁行：按 agent 作用域屏蔽原生 write / edit（守卫 + restrict 收窄）
-preset/preset.yml        # preset 的名字/描述（dsh 列表里显示的内容）
-scripts/install-preset.mjs  # 从本机 dsh 派生用户 preset（--mask-native 一并装门禁）
-cordis.patch.yml         # 宿主平面安装用的 bundle patch
-tools/selftest.mjs       # 端到端自测（核心 + 插件层 + 返回值 + 策略层 + 门禁层 + 引导段）
-tools/probe-mask.mjs     # 用真实 dsh 包与注册表验证门禁的注册表语义（缺包时退出码 2）
-tools/repro-mask.mjs     # 用真实 preset 服务与 agent 注册表验证门禁的组合时序（缺包时退出码 2）
-tools/check-license.mjs  # 许可证 / 依赖 / 纯 Node 卫生门禁
-tools/gen-schema.mjs     # 内嵌 schema 的权威来源与校验器
-tools/measure-context.mjs  # 模型可见字节的逐场景测量 + 原生工具对照
-tools/audit-session.mjs  # 真实会话日志的上下文对账 + 文本形状检查 + --tools 工具表视图
-```
-
-本插件不在工作区里留下任何文件：没有 `.dsh/backups/`，也没有 `.dsh/edits.log`。唯一被写入的就是目标文件。
 
 ## License
 

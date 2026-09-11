@@ -216,7 +216,7 @@ async function nodeOnlySuite(ws) {
   {
     writeFileSync(join(ws, 'binary.bin'), Buffer.from([0x41, 0x00, 0x42, 0x0a]))
     const result = await run({ file_path: 'binary.bin', grep: 'A', new_text: 'Z\n' })
-    check('refuses binary content (NUL)', !result.ok && /二进制/.test(result.stderr), result.stderr)
+    check('refuses binary content (NUL)', !result.ok && /NUL bytes/.test(result.stderr), result.stderr)
   }
   {
     writeFileSync(join(ws, 'broken.md'), Buffer.from([0x41, 0xc3, 0x28, 0x0a]))
@@ -265,17 +265,17 @@ async function nodeOnlySuite(ws) {
   }
   {
     const result = await run({ file_path: 'nope.md', grep: 'x', new_text: 'y\n' })
-    check('editing a missing file is refused', !result.ok && /不存在/.test(result.stderr), result.stderr)
+    check('editing a missing file is refused', !result.ok && /does not exist/.test(result.stderr), result.stderr)
   }
   {
     writeFileSync(join(ws, 'miss.md'), 'alpha\nbeta\ngamma\n')
     const result = await run({ file_path: 'miss.md', old_text: 'beta\ngamaa', new_text: 'x\n' })
-    check('a miss reports nearest candidates', !result.ok && /最接近/.test(result.stderr), result.stderr)
+    check('a miss reports nearest candidates', !result.ok && /Closest candidates/.test(result.stderr), result.stderr)
   }
   {
     writeFileSync(join(ws, 'relaxed.md'), 'keep   trailing\nnext line\n')
     const result = await run({ file_path: 'relaxed.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n' })
-    check('a relaxed match is announced in the brief', result.ok && /宽松/.test(result.brief), result.brief || result.stderr)
+    check('a relaxed match is announced in the brief', result.ok && /relaxed mode/.test(result.brief), result.brief || result.stderr)
   }
   {
     // 宽松命中的 span 是整行块：锚点没写换行结尾时，行尾空白与换行符必须留在文件里，否则替换
@@ -285,14 +285,14 @@ async function nodeOnlySuite(ws) {
     const text = readFileSync(join(ws, 'fuzzy-eol.md'), 'utf8')
     check('a relaxed hit stays inside its own line', result.ok && text === 'alpha\nX\ncccc\ndddd\n', JSON.stringify(text))
     check('a relaxed hit keeps the file line count', text.split('\n').length === 5, JSON.stringify(text))
-    check('the eol repair is stated in the brief', /行尾空白与换行符留在原地/.test(result.brief), result.brief)
+    check('the eol repair is stated in the brief', /stayed in place/.test(result.brief), result.brief)
   }
   {
     // 宽松命中在两处都成立时不得挑第一处：与精确命中同样拒绝写盘。
     const seed = 'alpha\n   BBBB\ncccc\n   BBBB\ndddd\n'
     writeFileSync(join(ws, 'fuzzy-ambiguous.md'), seed)
     const result = await run({ file_path: 'fuzzy-ambiguous.md', old_text: '  BBBB   ', new_text: 'X' })
-    check('a relaxed hit matching twice is refused', !result.ok && /宽松模式/.test(result.stderr), result.stderr)
+    check('a relaxed hit matching twice is refused', !result.ok && /relaxed mode/.test(result.stderr), result.stderr)
     check('a refused relaxed hit leaves the file untouched', readFileSync(join(ws, 'fuzzy-ambiguous.md'), 'utf8') === seed)
   }
   {
@@ -305,7 +305,7 @@ async function nodeOnlySuite(ws) {
 
     writeFileSync(join(ws, 'fuzzy-threshold-ok.md'), `${near}\n`)
     const accepted = await run({ file_path: 'fuzzy-threshold-ok.md', old_text: anchor, new_text: 'replaced\n' })
-    check('a block just above the 0.9 threshold still matches', accepted.ok && /宽松/.test(accepted.brief),
+    check('a block just above the 0.9 threshold still matches', accepted.ok && /relaxed mode/.test(accepted.brief),
       accepted.stderr || accepted.brief)
     check('similarity just above the threshold', similarity(near, anchor.trimEnd()) > 0.9,
       String(similarity(near, anchor.trimEnd())))
@@ -320,11 +320,11 @@ async function nodeOnlySuite(ws) {
     // 锚点带换行、替换文本不带时行会被并起来（README 的既有约定），brief 要说出来。
     writeFileSync(join(ws, 'eol-merge.md'), 'alpha\n   BBBB\ncccc\n')
     const result = await run({ file_path: 'eol-merge.md', old_text: 'BBBB\n', new_text: 'X' })
-    check('a line-absorbing replacement is announced', result.ok && /并成一行/.test(result.brief), result.brief || result.stderr)
+    check('a line-absorbing replacement is announced', result.ok && /joined with the next/.test(result.brief), result.brief || result.stderr)
   }
   {
     const result = await run({ file_path: 'sample.md', grep: '^one$', new_text: 'one\n' })
-    check('a no-change edit is refused', !result.ok && /没有产生任何变化/.test(result.stderr), result.stderr)
+    check('a no-change edit is refused', !result.ok && /no change/.test(result.stderr), result.stderr)
   }
   {
     // 空 `content` 配不存在的目标 = 创建零字节文件（与原生 write 一致）。
@@ -336,7 +336,7 @@ async function nodeOnlySuite(ws) {
     check('write(create) with empty content fills in missing parents',
       (await write({ file_path: 'deep/nested/empty.txt', content: '' })).ok && existsSync(join(ws, 'deep', 'nested', 'empty.txt')))
     const again = await write({ file_path: 'zero-byte.txt', content: '' })
-    check('write(overwrite) with empty content on an empty file is still a no-op', !again.ok && /没有产生任何变化/.test(again.stderr), again.stderr)
+    check('write(overwrite) with empty content on an empty file is still a no-op', !again.ok && /no change/.test(again.stderr), again.stderr)
   }
 
   {
@@ -519,7 +519,7 @@ async function resultTextSuite() {
   const failText = textOf(editTool, missing)
   check(
     'result: a failure keeps the full reason',
-    failText.startsWith('FAIL\n') && failText.includes('目标不存在：nope.md'),
+    failText.startsWith('FAIL\n') && failText.includes('target does not exist: nope.md'),
     failText,
   )
 
@@ -558,7 +558,7 @@ async function policySuite() {
   const refused = await editTool.execute({ file_path: 'policy.md', grep: '^BETA', new_text: 'no\n' }, exec)
   check(
     'policy: read-only refuses and names the policy',
-    refused.ok === false && /当前文件策略 read-only/.test(refused.stderr),
+    refused.ok === false && /session file policy is read-only/.test(refused.stderr),
     refused.stderr,
   )
   check('policy: the refusal is not a path complaint', !/工作区之外/.test(refused.stderr), refused.stderr)
@@ -569,7 +569,7 @@ async function policySuite() {
   assertShape('policy: a refusal still matches OUTPUT_SCHEMA', refused)
   check(
     'policy: the refusal renders as FAIL plus the reason',
-    editTool.output.render({}, refused)[0].text === 'FAIL\n当前文件策略 read-only，拒绝写入（策略来自会话设置，不是路径问题）。',
+    editTool.output.render({}, refused)[0].text === 'FAIL\nthe session file policy is read-only, so writing is refused (the policy comes from the session settings, not from the path).',
     editTool.output.render({}, refused)[0].text,
   )
 
