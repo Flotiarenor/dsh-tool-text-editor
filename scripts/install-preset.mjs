@@ -83,8 +83,8 @@ function pluginBlock(sourcePath, maskNative) {
     '#',
     '# 原生 `edit` / `write` 都会丢 UTF-8 BOM，且不还原文件自身的行尾（往 CRLF 文件写 LF 内容就变成 LF）；',
     '# 原生 `edit` 还只做精确匹配（`old_string` 差一个空格就报 FS_EDIT_NOT_FOUND）。本行两个工具保 BOM 与文件',
-    '# 自身行尾，精确失败时按行块相似度回退并给出最接近的候选。read-only 会话下在任何 I/O 之前拒写；模型可见',
-    '# 文本只有一行统计。',
+    '# 自身行尾，匹配时忽略空白（空格、空行、换行都忽略；字符不同即拒写并点名第一处差异）。read-only 会话下',
+    '# 在任何 I/O 之前拒写；模型可见文本只有一行统计。',
     '#',
     ...(maskNative
       ? ['# 原生 `edit`/`write` 由下面的门禁行按 agent 作用域屏蔽，本行因此改用 `guidance: short`。']

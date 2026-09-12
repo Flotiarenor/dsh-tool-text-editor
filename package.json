@@ -1,7 +1,7 @@
 {
   "name": "@flotiarenor/dsh-tool-text-editor",
-  "version": "1.3.0",
-  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness. They fix what the built-in write/edit cannot do: both drop a UTF-8 BOM, neither restores the file's own line-ending style (writing LF content turns a CRLF file into an LF file), and edit matches old_string exactly with no fallback. These tools keep the BOM and the file's CRLF/LF style, fall back to relaxed line-block matching with nearest-candidate hints, accept grep/lines anchors, and return one stat line instead of echoing the change back into the model context. A call writes the target file and nothing else: no backup, no ledger, no diff projection. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
+  "version": "1.3.1",
+  "description": "Byte-faithful text editing tools (edit_text / write_text) for DeepSeek Harness. They fix what the built-in write/edit cannot do: both drop a UTF-8 BOM, neither restores the file's own line-ending style (writing LF content turns a CRLF file into an LF file), and edit matches old_string exactly with no fallback. These tools keep the BOM and the file's CRLF/LF style, ignore whitespace while matching (spaces, blank lines, line breaks -- a character difference is refused with the first differing line), accept grep/lines anchors, and return one stat line instead of echoing the change back into the model context. A call writes the target file and nothing else: no backup, no ledger, no diff projection. Pure Node and in-process: no external runtime, no child process, no third-party package, no build step, no imports beyond node: builtins.",
   "type": "module",
   "main": "lib/editor.mjs",
   "exports": {

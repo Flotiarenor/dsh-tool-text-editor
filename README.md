@@ -11,9 +11,9 @@ Model-facing tools for [DeepSeek Harness](https://github.com/deepseek-ai) (dsh) 
 |---|---|---|
 | **UTF-8 BOM lost** on any edit or overwrite | the implementation has no BOM handling; Node's `TextDecoder` strips a leading BOM by default | BOM preserved |
 | **Line-ending style not restored** on a full overwrite | `writeText` writes `content` verbatim, so LF content turns a CRLF file into an LF file | line endings follow the file |
-| **`FS_EDIT_NOT_FOUND`** when `old_string` differs by a space | the built-in `edit` matches literally, with no fallback | exact → relaxed → nearest candidates (ambiguity refuses to write) |
+| **`FS_EDIT_NOT_FOUND`** when `old_string` differs by a space | the built-in `edit` matches literally, with no fallback | exact → whitespace-insensitive → one first-difference hint (ambiguity refuses to write) |
 
-Also **`grep` / `lines` anchors** (old text is never copied by hand) and **near-miss candidates**;
+Also **`grep` / `lines` anchors** (old text is never copied by hand) and a **single first-difference hint** on a miss;
 "Return value" documents the result value and the model-facing text.
 
 A call leaves **no side artifacts**: the only thing written is the target file.
@@ -139,7 +139,7 @@ The row has no Config schema either: `config:` is passed through as-is.
 | `mode` | `replace` (default) / `after` / `before` / `append` / `prepend` |
 | `count` | The expected number of hits: occurrences of the literal for `old_text` (all of them replaced), regex hits for `grep`, covered lines for `lines`. Any mismatch refuses to write |
 | Trailing newline | Both anchor kinds span the line block **with** its trailing newline, so end `new_text` with a newline too; otherwise the replacement joins the following line and the file loses a line (the `+1/-2` stat reports it) |
-| Matching | Exact → relaxed (trailing whitespace, line-block similarity) → nearest candidates on a miss; a match hitting several places without `count` refuses to write, and a relaxed hit adds one `[warn]` line to the result |
+| Matching | Exact → whitespace-insensitive (spaces, indentation, blank lines and line breaks are all ignored; the replaced range is the file's own whole lines) → a **single** first-difference hint on a miss; a match hitting several places without `count` refuses to write, and a whitespace-insensitive hit adds one `[warn]` line to the result. A **character** difference is always refused, naming the first line that differs — the earlier line-block similarity fallback used to accept those and silently discard the differing characters |
 | No k-th hit | `count` is the only disambiguation knob, and it means *confirmation*, not *selection*. To change one occurrence among several, make the anchor unique — a longer `old_text`, or `lines` / `grep` |
 
 ### `write_text` — create or fully replace a file
@@ -221,7 +221,7 @@ writing the same fixture twice:
 | CRLF file, `write` with CRLF content | 3 CRLF in, 3 out (content is written verbatim) | same |
 | CRLF file, `write` with LF content | **3 CRLF in, 0 out** — the file silently becomes LF | CRLF kept: the file's own style wins |
 | BOM + CRLF file, either tool | **BOM gone** | BOM kept |
-| Anchor missing a trailing space | `FS_EDIT_NOT_FOUND`, no fallback (a re-read is the only recovery) | relaxed line-block match, one `[warn]` line |
+| Anchor missing a trailing space | `FS_EDIT_NOT_FOUND`, no fallback (a re-read is the only recovery) | whitespace-insensitive match, one `[warn]` line |
 | Literal appearing twice | refused (`FS_AMBIGUOUS_EDIT`) unless `replace_all: true` | refused unless `count` declares it |
 | Success result text | 128 B, echoing `before` / `after` for the GUI | 17–21 B, echoing nothing |
 
@@ -245,8 +245,9 @@ node tools/repro-mask.mjs               # the mask on real presets + agents: com
 ```
 
 `npm test` chains the licence gate, the self-test and `measure-context --cap 2048`: no single call may put
-more than 2 KB of model-visible text into the context. The current worst scenario is the 1.6 KB ambiguity
-hint; a successful call is always two lines, 17–21 B.
+more than 2 KB of model-visible text into the context. The measured worst scenario is a miss with a 5 KB
+anchor at 260 B; a successful exact call is two lines, 17–21 B, and a whitespace-insensitive hit adds one
+`[warn]` line.
 
 These live in the repository only: `tools/` is deliberately outside the `files` whitelist, so the published
 package is just the plugin, its preset installer, the docs and the license. Each script's own header documents
@@ -254,7 +255,7 @@ what it asserts and why; what follows is the shape of each.
 
 | Tool | Behaviour |
 | --- | --- |
-| `tools/selftest.mjs` | The end-to-end suite, needing no dsh: BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, relaxed matching (the similarity threshold pinned on both sides), usage errors, binary/invalid-UTF-8 refusal, majority EOL inference, concurrent writes, parent-directory creation, errno-only failure text — plus a plugin layer (`apply()` on a fake context: registration, the guidance section, every value satisfying `OUTPUT_SCHEMA`, the literal `render()` text, config plumbing, no `.dsh/` left behind), a return-value layer, a policy layer (`read-only` refusals), a mask layer (a fake world for the guard, the membership probe, the sweep, disposal and the unload hook) and a guidance layer. 148 checks |
+| `tools/selftest.mjs` | The end-to-end suite, needing no dsh: BOM/EOL fidelity, all four anchor kinds, `count`, ambiguity refusal, whitespace-insensitive matching (blank lines ignored, a character difference refused, a half-line anchor refused), usage errors, binary/invalid-UTF-8 refusal, majority EOL inference, concurrent writes, parent-directory creation, errno-only failure text — plus a plugin layer (`apply()` on a fake context: registration, the guidance section, every value satisfying `OUTPUT_SCHEMA`, the literal `render()` text, config plumbing, no `.dsh/` left behind), a return-value layer, a policy layer (`read-only` refusals), a mask layer (a fake world for the guard, the membership probe, the sweep, disposal and the unload hook) and a guidance layer. 150 checks |
 | `tools/probe-mask.mjs` | Mask registry semantics on the real packages and the real `dsh-agent` registry, mounted on a real scoped context: a masked agent loses `write` / `edit` and naming one yields `UNKNOWN_TOOL`, another composition keeps both, the standing scope still has them registered, an agent with no creation event is still blocked by the apply-time guard, and a host-plane row degrades to guard-only. 15 checks; exit 2 without a dsh installation |
 | `tools/repro-mask.mjs` | Mask composition timing on the real `dsh-agent-presets` service: created after the mount, re-linked after creation, first bind, switched away, and a child agent via `composeFrom`, with a foreign-guard host and another composition as controls. 23 checks; the regression test for a timing bug that shipped once (4/7 before the fix), exit 2 without the packages |
 

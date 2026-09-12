@@ -16,7 +16,7 @@ import { basename, dirname, join } from 'node:path'
 
 import { apply as applyMask } from '../lib/mask.mjs'
 
-import { applyPlan, similarity } from '../lib/core.mjs'
+import { applyPlan } from '../lib/core.mjs'
 import { OUTPUT_SCHEMA, apply, planEdit, planWrite } from '../lib/editor.mjs'
 
 let checks = 0
@@ -270,51 +270,71 @@ async function nodeOnlySuite(ws) {
   {
     writeFileSync(join(ws, 'miss.md'), 'alpha\nbeta\ngamma\n')
     const result = await run({ file_path: 'miss.md', old_text: 'beta\ngamaa', new_text: 'x\n' })
-    check('a miss reports nearest candidates', !result.ok && /Closest candidates/.test(result.stderr), result.stderr)
+    check('a miss names the first differing line pair',
+      !result.ok && /first difference: your old line 2 "gamaa" vs file line 3 "gamma"/.test(result.stderr), result.stderr)
   }
   {
-    writeFileSync(join(ws, 'relaxed.md'), 'keep   trailing\nnext line\n')
-    const result = await run({ file_path: 'relaxed.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n' })
-    check('a relaxed match is announced in the brief', result.ok && /relaxed mode/.test(result.brief), result.brief || result.stderr)
+    // 精确命中失败、只差空白（这里是行中间多两个空格）时仍然命中，并在 brief 里说清"忽略了空白"。
+    writeFileSync(join(ws, 'spacing.md'), 'keep   trailing\nnext line\n')
+    const result = await run({ file_path: 'spacing.md', old_text: 'keep trailing\nnext line', new_text: 'untouched\n' })
+    check('a whitespace-only difference still matches', result.ok, result.stderr)
+    check('ignoring whitespace is announced in the brief', /matched ignoring whitespace/.test(result.brief), result.brief)
   }
   {
-    // 宽松命中的 span 是整行块：锚点没写换行结尾时，行尾空白与换行符必须留在文件里，否则替换
-    // 会吃掉换行、把下一行并进来。
-    writeFileSync(join(ws, 'fuzzy-eol.md'), 'alpha\n   BBBB\ncccc\ndddd\n')
-    const result = await run({ file_path: 'fuzzy-eol.md', old_text: '  BBBB   ', new_text: 'X' })
-    const text = readFileSync(join(ws, 'fuzzy-eol.md'), 'utf8')
-    check('a relaxed hit stays inside its own line', result.ok && text === 'alpha\nX\ncccc\ndddd\n', JSON.stringify(text))
-    check('a relaxed hit keeps the file line count', text.split('\n').length === 5, JSON.stringify(text))
-    check('the eol repair is stated in the brief', /stayed in place/.test(result.brief), result.brief)
+    // 用户实测的那次：锚点里多了一个空行（文件里没有），旧实现整体未命中、还列出三段互相重叠的候选。
+    // 现在空行属于"被忽略的空白"，且替换落在文件自己的行跨度上——块外面的行一行都不许动。
+    writeFileSync(join(ws, 'blank-line.md'), 'wrap\n  // 6b3)\n  body();\n  }\n  // 6c)\nnext\n')
+    const result = await run({
+      file_path: 'blank-line.md',
+      old_text: '  // 6b3)\n  body();\n  }\n\n  // 6c)\n',
+      new_text: '  // 6b3)\n  body();\n  }\n',
+    })
+    const text = readFileSync(join(ws, 'blank-line.md'), 'utf8')
+    check('a blank line in the anchor is ignored', result.ok, result.stderr)
+    check('only the quoted lines are replaced', text === 'wrap\n  // 6b3)\n  body();\n  }\nnext\n', JSON.stringify(text))
   }
   {
-    // 宽松命中在两处都成立时不得挑第一处：与精确命中同样拒绝写盘。
+    // 锚点里全是空白：去掉空白后是个空串，能匹配任何位置，必须当成用法问题拒掉。
+    const result = await run({ file_path: 'spacing.md', old_text: ' \n\t\n', new_text: 'x\n' })
+    check('a whitespace-only anchor is refused', !result.ok && /nothing but whitespace/.test(result.stderr), result.stderr)
+  }
+  {
+    // 字符不同一律拒写（旧实现在整块相似度 ≥ 0.9 时接受并整块替换，静默吃掉那几个字符）。
+    const seed = 'alpha\nbravo\ncharlieXYZ\ndelta\n'
+    writeFileSync(join(ws, 'char-diff.md'), seed)
+    const result = await run({ file_path: 'char-diff.md', old_text: 'alpha\nbravo\ncharlie\ndelta\n', new_text: 'replaced\n' })
+    check('a character difference is refused',
+      !result.ok && /your old line 3 "charlie" vs file line 3 "charlieXYZ"/.test(result.stderr), result.stderr)
+    check('a refused character difference leaves the file untouched',
+      readFileSync(join(ws, 'char-diff.md'), 'utf8') === seed)
+  }
+  {
+    // 换行也被忽略之后，锚点可能只盖住半行（`const x = 1;` 是 `const x = 1;const y = 2;` 的子串）。
+    // 按行跨度替换会连那半行剩下的内容一起吃掉，所以首尾不贴整行就拒写。
+    const seed = 'const  x = 1;const y = 2;\n'
+    writeFileSync(join(ws, 'partial-line.md'), seed)
+    const result = await run({ file_path: 'partial-line.md', old_text: 'const x = 1;', new_text: 'gone\n' })
+    check('an anchor covering only part of a line is refused',
+      !result.ok && /covers only part of that line/.test(result.stderr), result.stderr)
+    check('a refused partial-line anchor leaves the file untouched',
+      readFileSync(join(ws, 'partial-line.md'), 'utf8') === seed)
+  }
+  {
+    // 命中区间落在整行上：锚点没写换行结尾时，换行符必须留在文件里，否则替换会把下一行并进来。
+    writeFileSync(join(ws, 'ws-edges.md'), 'alpha\n   BBBB\ncccc\ndddd\n')
+    const result = await run({ file_path: 'ws-edges.md', old_text: '  BBBB   ', new_text: 'X' })
+    const text = readFileSync(join(ws, 'ws-edges.md'), 'utf8')
+    check('a whitespace-insensitive hit stays inside its own line', result.ok && text === 'alpha\nX\ncccc\ndddd\n', JSON.stringify(text))
+  }
+  {
+    // 忽略空白后命中两处时不得挑第一处：与精确命中同样拒绝写盘。
     const seed = 'alpha\n   BBBB\ncccc\n   BBBB\ndddd\n'
-    writeFileSync(join(ws, 'fuzzy-ambiguous.md'), seed)
-    const result = await run({ file_path: 'fuzzy-ambiguous.md', old_text: '  BBBB   ', new_text: 'X' })
-    check('a relaxed hit matching twice is refused', !result.ok && /relaxed mode/.test(result.stderr), result.stderr)
-    check('a refused relaxed hit leaves the file untouched', readFileSync(join(ws, 'fuzzy-ambiguous.md'), 'utf8') === seed)
-  }
-  {
-    // 0.9 这条相似度阈值是宽松匹配的松紧旋钮：钉住它的两侧，否则把它调松（例如 0.9 → 0.5）会让
-    // 本来该拒绝的近似块被静默接受，而既有断言全绿。两侧都用"中间一行长短不同"来构造，
-    // 精确命中必然失败（首尾行相同、中间行不同，匹配层会进入宽松分支）。
-    const near = ['alpha', 'bravo', 'charlieXYZQRS', 'delta', 'echo'].join('\n')
-    const far = ['alpha', 'bravo', 'charlieXYZQRSTU', 'delta', 'echo'].join('\n')
-    const anchor = `${['alpha', 'bravo', 'charlie', 'delta', 'echo'].join('\n')}\n`
-
-    writeFileSync(join(ws, 'fuzzy-threshold-ok.md'), `${near}\n`)
-    const accepted = await run({ file_path: 'fuzzy-threshold-ok.md', old_text: anchor, new_text: 'replaced\n' })
-    check('a block just above the 0.9 threshold still matches', accepted.ok && /relaxed mode/.test(accepted.brief),
-      accepted.stderr || accepted.brief)
-    check('similarity just above the threshold', similarity(near, anchor.trimEnd()) > 0.9,
-      String(similarity(near, anchor.trimEnd())))
-
-    writeFileSync(join(ws, 'fuzzy-threshold-no.md'), `${far}\n`)
-    const refused = await run({ file_path: 'fuzzy-threshold-no.md', old_text: anchor, new_text: 'replaced\n' })
-    check('a block just below the 0.9 threshold is a miss', !refused.ok, refused.brief)
-    check('similarity just below the threshold', similarity(far, anchor.trimEnd()) < 0.9,
-      String(similarity(far, anchor.trimEnd())))
+    writeFileSync(join(ws, 'ws-ambiguous.md'), seed)
+    const result = await run({ file_path: 'ws-ambiguous.md', old_text: '  BBBB   ', new_text: 'X' })
+    check('a whitespace-insensitive hit matching twice is refused',
+      !result.ok && /it hits 2 places/.test(result.stderr), result.stderr)
+    check('a refused whitespace-insensitive hit leaves the file untouched',
+      readFileSync(join(ws, 'ws-ambiguous.md'), 'utf8') === seed)
   }
   {
     // 锚点带换行、替换文本不带时行会被并起来（README 的既有约定），brief 要说出来。
