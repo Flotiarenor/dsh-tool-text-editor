@@ -73,8 +73,8 @@ dsh --profile web --dump-config   # 应当能看到 "# == @flotiarenor/dsh-tool-
 | 项 | 规则 |
 | --- | --- |
 | 必填 | `file_path` 与 `new_text` |
-| 锚点，且恰好一个 | `old_text`（字面量，抄自 `read`）/ `grep`（正则；命中的行或行块，含行尾换行符）/ `lines`（如 `"263:270"`，同样含行尾换行符） |
-| `mode` | `replace`（默认）/ `after` / `before` / `append` / `prepend` |
+| 锚点，且恰好一个 | `old_text`（字面量，抄自 `read`；**仅 `replace`**，`after` / `before` 需 `grep` / `lines`）/ `grep`（正则；命中的行或行块，含行尾换行符）/ `lines`（如 `"263:270"`，同样含行尾换行符） |
+| `mode` | `replace`（默认）/ `after` / `before`（两者只吃 `grep` / `lines` 锚点，不吃 `old_text`）/ `append` / `prepend` |
 | `count` | 声明的命中数：`old_text` 为字面量出现次数（全部替换），`grep` 为正则命中处数，`lines` 为覆盖行数。与实际情况不符即拒绝写入 |
 | 尾随换行 | 两种锚点都覆盖整行行块**并含行尾换行符**，因此 `new_text` 也应以换行结尾；否则替换会把下一行并入 |
 | 匹配顺序 | 精确 → 忽略空白（空格、缩进、空行、换行一律忽略，命中的是文件自己的整行块）→ 未命中时给出**一处**差异（你的第几行 vs 文件第几行）；命中多处且未声明 `count` 时拒绝写盘，忽略空白的命中会在结果中附加一行 `[warn]`。字符不同一律拒写并点名第一处：旧版本的整块相似度回退会在这种时候静默吃掉差异字符 |

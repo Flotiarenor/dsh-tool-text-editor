@@ -66,10 +66,10 @@ const {
 const editParametersDsl = {
   file_path: { type: 'string', required: true, description: 'Target file; relative resolves against the session cwd.' },
   new_text: { type: 'string', required: true, description: 'Replacement / inserted text.' },
-  old_text: { type: 'string', description: 'Literal anchor text (exactly one anchor source).' },
+  old_text: { type: 'string', description: 'Literal anchor text, for `replace` only (exactly one anchor source): `after`/`before` need `grep` or `lines`.' },
   grep: { type: 'string', description: 'Regex anchor: the matching line block, its trailing newline included.' },
   lines: { type: 'string', description: 'Line anchor, e.g. "263:270" or "120"; trailing newline included.' },
-  mode: { type: 'string', enum: ['replace', 'after', 'before', 'append', 'prepend'], description: 'replace (default) substitutes the anchor; after/before insert beside a grep/lines anchor; append/prepend use the file ends.' },
+  mode: { type: 'string', enum: ['replace', 'after', 'before', 'append', 'prepend'], description: 'replace (default) substitutes the anchor; after/before insert beside a grep/lines anchor only (never old_text); append/prepend use the file ends.' },
   count: { type: 'number', description: 'Declare the expected number of hits (mismatch refuses to write); for `lines` anchors it declares how many lines the anchor covers.' },
 }
 

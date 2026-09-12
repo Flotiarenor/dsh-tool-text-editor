@@ -135,8 +135,8 @@ The row has no Config schema either: `config:` is passed through as-is.
 | Aspect | Rule |
 | --- | --- |
 | Required | `file_path` and `new_text` |
-| Anchor, exactly one | `old_text` (literal, copied from `read`) / `grep` (regex; the matched line/block including its trailing newline) / `lines` (e.g. `"263:270"`, also including the trailing newline) |
-| `mode` | `replace` (default) / `after` / `before` / `append` / `prepend` |
+| Anchor, exactly one | `old_text` (literal, copied from `read`; **`replace` only** — `after`/`before` need `grep`/`lines`) / `grep` (regex; the matched line/block including its trailing newline) / `lines` (e.g. `"263:270"`, also including the trailing newline) |
+| `mode` | `replace` (default) / `after` / `before` (both take a `grep`/`lines` anchor, never `old_text`) / `append` / `prepend` |
 | `count` | The expected number of hits: occurrences of the literal for `old_text` (all of them replaced), regex hits for `grep`, covered lines for `lines`. Any mismatch refuses to write |
 | Trailing newline | Both anchor kinds span the line block **with** its trailing newline, so end `new_text` with a newline too; otherwise the replacement joins the following line and the file loses a line (the `+1/-2` stat reports it) |
 | Matching | Exact → whitespace-insensitive (spaces, indentation, blank lines and line breaks are all ignored; the replaced range is the file's own whole lines) → a **single** first-difference hint on a miss; a match hitting several places without `count` refuses to write, and a whitespace-insensitive hit adds one `[warn]` line to the result. A **character** difference is always refused, naming the first line that differs — the earlier line-block similarity fallback used to accept those and silently discard the differing characters |
@@ -234,7 +234,7 @@ tools in the model's catalog.
 
 ```powershell
 # run from the root of a clone of this repository
-node tools/selftest.mjs                 # 148/148 on Windows + Node 24
+node tools/selftest.mjs                 # 150/150 on Windows + Node 24
 node tools/check-license.mjs            # 30/30 license / dependency / Node-only gate
 node tools/gen-schema.mjs               # embedded schemas still match the DSL
 node tools/measure-context.mjs          # per-scenario model-visible bytes
